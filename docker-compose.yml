@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: records_api
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+    env_file: .env.runtime
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8888"
+      DATABASE_URL: postgresql+psycopg2://records:records@db:5432/records
+    volumes:
+      - ./static:/app/static
+      - ./artwork:/app/app/static/artwork
+      - ./thumbs:/app/app/static/thumbs
+    networks:
+      - records_net
+
+  db:
+    image: postgres:16
+    container_name: records_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres -h 127.0.0.1 -p 5432 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - records_net
+    ports:
+      - "5433:5432"  # Change this line from 5432:5432 to 5433:5432
+
+volumes:
+  postgres_data:
+
+networks:
+  records_net:
+    driver: bridge
