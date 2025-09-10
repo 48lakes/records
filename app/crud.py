@@ -15,15 +15,18 @@ def list_records_all(db: Session, sort_by="artist", order="asc", format_filter: 
     if q:
         where.append("(LOWER(artist_name) LIKE :q OR LOWER(title) LIKE :q)")
         params["q"] = f"%{q.lower()}%"
-    sql = f"""        SELECT id, artist_name, title AS album, year, format, label, country, genre, style,
-               cover_art_url AS artwork_full,
-               COALESCE(cover_thumb_url, cover_art_url, '') AS artwork_thumb
+    sql = f"""        SELECT id, discogs_id, title, artist_name, year, label, country, format, genre, style,
+               cover_art_url,
+               cover_thumb_url,
+               artwork_url,
+               mb_release_group_id,
+               artist_id
         FROM records
         WHERE {' AND '.join(where)}
         ORDER BY {col} {ord_sql}, id ASC
     """
     items = [dict(row) for row in db.execute(text(sql), params).mappings().all()]
-    return {"total": len(items), "items": items}
+    return {"total": len(items), "records": items}
 
 def format_counts(db: Session) -> List[Dict[str, Any]]:
     sql = "SELECT format, COUNT(*) AS count FROM records GROUP BY format ORDER BY format NULLS LAST"
