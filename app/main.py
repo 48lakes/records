@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 # Import your modules
 from .db import engine, get_db
-from .crud import list_records_all
+from .crud import list_records_all, get_record_tracks, save_record_tracks, fetch_and_store_tracklist
 from .importer import sync_discogs_collection
 
 # Configure logging
@@ -669,136 +669,105 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "records-api"}
 
-# Add this endpoint after the existing debug endpoints
-
-@app.get("/debug/record-raw/{record_id}")
-async def debug_record_raw(record_id: int, db: Session = Depends(get_db)):
-    """Debug endpoint to see raw record data as returned by /records/all"""
+@app.get("/records/{record_id}/tracklist")
+async def get_record_tracklist(record_id: int, db: Session = Depends(get_db)):
+    """Get tracklist for a record (from local database or fetch from Discogs)"""
     try:
-        # First, let's see what list_records_all actually returns
-        logger.info(f"Getting records data for record_id: {record_id}")
+        # First, try to get tracks from local database
+        local_tracks = get_record_tracks(db, record_id)
         
-        try:
-            result = list_records_all(db, "artist", "asc", "", "")
-            logger.info(f"list_records_all returned type: {type(result)}")
-            logger.info(f"list_records_all keys: {result.keys() if isinstance(result, dict) else 'Not a dict'}")
-        except Exception as list_error:
-            logger.error(f"Error calling list_records_all: {list_error}")
-            
-            # Fallback: get record directly from database
-            query = text("SELECT * FROM records WHERE id = :record_id")
-            db_result = db.execute(query, {"record_id": record_id}).fetchone()
-            
-            if not db_result:
-                raise HTTPException(status_code=404, detail="Record not found in database")
-            
+        if local_tracks:
+            logger.info(f"Found {len(local_tracks)} tracks locally for record {record_id}")
             return {
-                "record_from_db": dict(db_result._mapping) if hasattr(db_result, '_mapping') else str(db_result),
-                "field_analysis": {
-                    "has_artist_name": hasattr(db_result, 'artist_name'),
-                    "has_title": hasattr(db_result, 'title'),
-                    "artist_value": getattr(db_result, 'artist_name', 'MISSING'),
-                    "title_value": getattr(db_result, 'title', 'MISSING'),
-                    "all_fields": [attr for attr in dir(db_result) if not attr.startswith('_')]
-                },
-                "error": f"list_records_all failed: {list_error}",
-                "source": "direct_db_query"
+                "tracklist": local_tracks,
+                "source": "local",
+                "message": f"Loaded {len(local_tracks)} tracks from local database"
             }
         
-        # Check if result has records
-        if not isinstance(result, dict) or 'records' not in result:
-            logger.error(f"Unexpected result structure: {result}")
-            raise HTTPException(status_code=500, detail=f"Unexpected result structure from list_records_all")
+        # If no local tracks, try to fetch from Discogs
+        record_query = text("SELECT discogs_id FROM records WHERE id = :record_id")
+        result = db.execute(record_query, {"record_id": record_id}).fetchone()
         
-        records_list = result.get('records', [])
-        logger.info(f"Found {len(records_list)} records")
+        if not result:
+            raise HTTPException(status_code=404, detail="Record not found")
         
-        # Find the specific record
-        matching_record = None
-        for record in records_list:
-            logger.info(f"Checking record: {record.get('id')} == {record_id}")
-            if record.get('id') == record_id:
-                matching_record = record
-                break
+        discogs_id = result.discogs_id
+        if not discogs_id:
+            return {
+                "tracklist": [],
+                "source": "none",
+                "message": "No Discogs ID available for this record"
+            }
         
-        if not matching_record:
-            # Show a sample of available records for debugging
-            sample_records = records_list[:3]
-            raise HTTPException(
-                status_code=404, 
-                detail={
-                    "message": "Record not found in records list",
-                    "total_records": len(records_list),
-                    "sample_records": sample_records,
-                    "looking_for_id": record_id
-                }
-            )
+        # Fetch from Discogs and store locally
+        logger.info(f"Fetching tracklist from Discogs for record {record_id}, Discogs ID {discogs_id}")
         
-        return {
-            "record_from_api": matching_record,
-            "field_analysis": {
-                "has_artist_name": "artist_name" in matching_record,
-                "has_title": "title" in matching_record,
-                "has_album": "album" in matching_record,
-                "artist_value": matching_record.get('artist_name', 'MISSING'),
-                "title_value": matching_record.get('title', 'MISSING'),
-                "all_keys": list(matching_record.keys()) if isinstance(matching_record, dict) else "Not a dict"
-            },
-            "source": "list_records_all"
-        }
-        
+        if fetch_and_store_tracklist(db, record_id, discogs_id):
+            # Get the newly stored tracks
+            local_tracks = get_record_tracks(db, record_id)
+            return {
+                "tracklist": local_tracks,
+                "source": "discogs",
+                "message": f"Fetched and stored {len(local_tracks)} tracks from Discogs"
+            }
+        else:
+            return {
+                "tracklist": [],
+                "source": "error",
+                "message": "Failed to fetch tracklist from Discogs"
+            }
+            
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        logger.error(f"Debug record raw error: {e}")
-        logger.exception("Full exception details:")
-        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
+        logger.error(f"Error getting tracklist for record {record_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Also add a simpler debug endpoint to check what records actually exist
-@app.get("/debug/sample-records")
-async def debug_sample_records(db: Session = Depends(get_db)):
-    """Get a few sample records to see the data structure"""
+@app.post("/records/{record_id}/tracklist")
+async def update_record_tracklist(
+    record_id: int,
+    tracks_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Manually update tracklist for a record"""
     try:
-        # Try list_records_all first
-        try:
-            result = list_records_all(db, "artist", "asc", "", "")
-            records_list = result.get('records', [])[:5]  # Get first 5 records
-            
+        # Verify record exists
+        record_query = text("SELECT id FROM records WHERE id = :record_id")
+        result = db.execute(record_query, {"record_id": record_id}).fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Record not found")
+        
+        tracklist = tracks_data.get("tracklist", [])
+        
+        if save_record_tracks(db, record_id, tracklist):
             return {
-                "source": "list_records_all",
-                "total_found": len(result.get('records', [])),
-                "sample_records": records_list,
-                "data_structure": {
-                    "result_type": type(result).__name__,
-                    "result_keys": list(result.keys()) if isinstance(result, dict) else "Not a dict",
-                    "first_record_keys": list(records_list[0].keys()) if records_list and isinstance(records_list[0], dict) else "No records or not dict"
-                }
+                "success": True,
+                "message": f"Updated tracklist with {len(tracklist)} tracks"
             }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save tracklist")
             
-        except Exception as list_error:
-            logger.error(f"list_records_all failed: {list_error}")
-            
-            # Fallback to direct database query
-            query = text("SELECT id, artist_name, title, discogs_id FROM records ORDER BY id LIMIT 5")
-            db_result = db.execute(query).fetchall()
-            
-            sample_records = []
-            for row in db_result:
-                sample_records.append({
-                    "id": row.id,
-                    "artist_name": row.artist_name,
-                    "title": row.title,
-                    "discogs_id": row.discogs_id
-                })
-            
-            return {
-                "source": "direct_db_query",
-                "total_found": len(sample_records),
-                "sample_records": sample_records,
-                "list_records_all_error": str(list_error)
-            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating tracklist for record {record_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/records/{record_id}/tracklist")
+async def delete_record_tracklist(record_id: int, db: Session = Depends(get_db)):
+    """Delete tracklist for a record"""
+    try:
+        delete_query = text("DELETE FROM tracks WHERE record_id = :record_id")
+        result = db.execute(delete_query, {"record_id": record_id})
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": f"Deleted tracklist for record {record_id}"
+        }
         
     except Exception as e:
-        logger.error(f"Debug sample records error: {e}")
+        logger.error(f"Error deleting tracklist for record {record_id}: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

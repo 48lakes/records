@@ -1,6 +1,7 @@
 from __future__ import annotations
 from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import Integer, String, Text, Column, DateTime, ForeignKey
+from sqlalchemy.sql import func
 
 Base = declarative_base()
 
@@ -31,6 +32,9 @@ class Record(Base):
     # catalog_number = mapped_column(String)  # This column doesn't exist in your DB
     artwork_url = mapped_column(String)  # This was added successfully
     
+    # Add this relationship
+    tracks = relationship("Track", back_populates="record", cascade="all, delete-orphan")
+
     def __repr__(self):
         return f"<Record(title='{self.title}', artist_name='{self.artist_name}')>"
 
@@ -42,3 +46,18 @@ class Record(Base):
     @property 
     def catalog_number(self):
         return None  # Return None since this column doesn't exist
+
+# Add this Track model
+class Track(Base):
+    __tablename__ = "tracks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False)
+    position = Column(String(10))
+    title = Column(String(500))
+    duration = Column(String(20))
+    track_order = Column(Integer)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationship back to Record
+    record = relationship("Record", back_populates="tracks")
