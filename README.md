@@ -1,4 +1,4 @@
-﻿# Records â€” Beta
+﻿# Records - Beta
 
 A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
 
