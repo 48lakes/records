@@ -1,0 +1,58 @@
+PLEX_URL=
+PLEX_TOKEN=
+
+# Optional: MusicBrainz rate limiting
+MUSICBRAINZ_RATE_LIMIT=1.0
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**No records loading:**
+```sh
+# Check database connection
+docker logs records_db
+docker exec -it records_db psql -U postgres -d records -c "SELECT COUNT(*) FROM records;"
+```
+
+**Artwork not displaying:**
+```sh
+# Check artwork files exist
+docker exec -it records_api ls -la /app/app/static/artwork/ | head -5
+curl -I "http://localhost:8888/static/artwork/31464128.jpg"
+```
+
+**Sync not working:**
+```sh
+# Check Discogs token
+curl -H "Authorization: Discogs token=YOUR_TOKEN" https://api.discogs.com/oauth/identity
+```
+
+### Reset Everything
+```sh
+# Stop containers
+docker compose down
+
+# Remove data (WARNING: destroys database)
+docker volume rm records_pgdata
+
+# Restart fresh
+docker compose up -d --build
+```
+
+## Next Steps
+
+- [ ] Enhanced overlay with full record details
+- [ ] Advanced search with multiple filters
+- [ ] Bulk artwork operations
+- [ ] Export functionality
+- [ ] Collection statistics and insights
+- [ ] User preferences and settings
+
+## Do not commit secrets
+- `.env.runtime`, dumps, overrides are ignored by `.gitignore`.
+
+## License
+
+Personal project -

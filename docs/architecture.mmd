@@ -1,0 +1,26 @@
+flowchart LR
+    subgraph Compose[Docker Compose]
+        API[FastAPI (uvicorn)\napp/main.py]
+        DB[(PostgreSQL 16)]
+        STATIC[/app/static\n(artwork, thumbs, js, css)/]
+        MUSIC[/MUSIC_ROOT (host)\nmounted read-only/]
+        API --- DB
+        API --- STATIC
+        API --- FF[ffmpeg\n(HLS transcode)]
+        MUSIC -. scan/stream .- API
+    end
+
+    BROWSER[Browser UI]
+    DISC[Discogs API]
+    MB[MusicBrainz]
+    CAA[Cover Art Archive]
+    PLEX[Plex Server]
+    BLUOS[BluOS Player]
+
+    BROWSER <--> API
+    API --> DISC
+    API --> MB
+    API --> CAA
+    API --> PLEX
+    API --> BLUOS
+

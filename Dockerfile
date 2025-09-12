@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         libjpeg62-turbo-dev \
         zlib1g-dev \
+        ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,10 +28,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY app ./app
 
 # Create necessary directories
-RUN mkdir -p /app/static/artwork /app/static/thumbs
+RUN mkdir -p /app/app/static/artwork /app/app/static/thumbs
 
 # Expose port
-EXPOSE 8000
+# Match compose `APP_PORT` (defaults to 8888 there)
+EXPOSE 8888
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s \

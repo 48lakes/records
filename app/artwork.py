@@ -48,7 +48,7 @@ async def _fetch_bytes(url: str, headers: Optional[Dict[str, str]] = None, timeo
                 continue
     return None
 
-async def _mb_search_release_group(artist: str, title: str) -> Optional[str]:
+async def _mb_search_release_group(artist: str, title: str) -> Optional[dict]:
     if not artist or not title:
         return None
     q_artist = artist.replace('"', '""')
@@ -65,7 +65,17 @@ async def _mb_search_release_group(artist: str, title: str) -> Optional[str]:
                     rgs = data.get("release-groups", [])
                     if not rgs:
                         return None
-                    return rgs[0].get("id")
+                    rg = rgs[0]
+                    rgid = rg.get("id")
+                    frd = (rg.get("first-release-date") or "").strip()
+                    year = None
+                    if frd:
+                        # Expect formats like YYYY or YYYY-MM-DD
+                        try:
+                            year = int(frd[:4])
+                        except Exception:
+                            year = None
+                    return {"id": rgid, "first_release_year": year}
                 if r.status_code in (429, 500, 502, 503, 504):
                     ra = r.headers.get("Retry-After")
                     try:
@@ -138,13 +148,17 @@ async def enrich_with_artwork(rec: Dict[str, Any]) -> Dict[str, Any]:
     artist = rec.get("artist_name") or ""
     title = rec.get("title") or ""
     mb_rgid: Optional[str] = None
+    mb_first_year: Optional[int] = None
     img_bytes: Optional[bytes] = None
 
     # Try MusicBrainz first
     try:
-        mb_rgid = await _mb_search_release_group(artist, title)
-        if mb_rgid:
-            img_bytes = await _mb_cover_art_rg(mb_rgid)
+        mb_info = await _mb_search_release_group(artist, title)
+        if mb_info:
+            mb_rgid = mb_info.get("id")
+            mb_first_year = mb_info.get("first_release_year")
+            if mb_rgid:
+                img_bytes = await _mb_cover_art_rg(mb_rgid)
     except Exception:
         mb_rgid = None
 
@@ -156,6 +170,8 @@ async def enrich_with_artwork(rec: Dict[str, Any]) -> Dict[str, Any]:
     if not img_bytes:
         if mb_rgid:
             rec["mb_release_group_id"] = mb_rgid
+        if mb_first_year and not rec.get("original_year"):
+            rec["original_year"] = mb_first_year
         # Ensure keys exist for upsert
         rec.setdefault("cover_thumb_url", None)
         return rec
@@ -167,6 +183,8 @@ async def enrich_with_artwork(rec: Dict[str, Any]) -> Dict[str, Any]:
     _save_scaled(img_bytes, full_path, full_target_px=600, thumb_path=thumb_path, thumb_px=150)
 
     rec["mb_release_group_id"] = mb_rgid or rec.get("mb_release_group_id")
+    if mb_first_year and not rec.get("original_year"):
+        rec["original_year"] = mb_first_year
     rec["cover_art_url"] = f"/static/artwork/{full_path.name}"
     rec["cover_thumb_url"] = f"/static/thumbs/{thumb_path.name}"
     return rec

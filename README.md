@@ -1,308 +1,264 @@
-# Records — Pre-Overlay Milestone
+# Records — Beta
 
-Two services: **db** (Postgres 16) + **api** (FastAPI). UI at `/`. Loads **full collection** via `/records/all` (no UI pagination). Thumbs are 150×150.
+A self‑hosted, single‑page app for browsing a Discogs‑backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
 
-## Features
 
-✅ **Complete Artwork UI** - Grid (200x200) and List (125x125) views with artwork display  
-✅ **Enhanced List View** - Shows format, label, genre, style details for each record  
-✅ **Artwork Management** - MusicBrainz/Discogs search integration with artwork editing  
-✅ **Dark Theme** - Complete responsive dark UI with proper contrast  
-✅ **View Switching** - Toggle between grid and detailed list views  
-✅ **Search & Filter** - Real-time search and format filtering  
-✅ **751 Records** - Full collection loading and display  
-✅ **Stable Codebase** - No JavaScript errors, clean field mapping  
+## Highlights
 
-## Run (Synology SSH)
+- Full‑collection UI: grid and list views with search, sort, and multi‑format filters.
+- Discogs sync: imports your collection with pagination handling and de‑duplication.
+- Artwork enrichment: MusicBrainz + Cover Art Archive lookups with local caching and thumbnails.
+- Playback helpers: local file streaming (Range + HLS via ffmpeg) and Plex proxy/HLS.
+- BluOS integration: browse folder mappings and trigger playback on a player.
+- Tracklists: derive/save tracklists from Discogs, Plex, or local library; stored per record.
+- Dark theme: responsive, keyboard‑friendly UI; no external JS frameworks.
 
-```sh
-cd /mnt/data/records_pre_overlay
-cat > .env.runtime <<'ENV'
-DATABASE_URL=postgresql+psycopg2://records:records@db:5432/records
-DISCOGS_TOKEN=YOUR_DISCOGS_TOKEN
-DISCOGS_USERNAME=YOUR_DISCOGS_USERNAME
-DISCOGS_USER_AGENT=records-app/1.0 (+you@example.com)
-PLEX_URL=
-PLEX_TOKEN=
-ENV
-
-docker compose --env-file .env.runtime up -d --build
-
-# seed sample rows (optional)
-docker compose exec -T db psql -U postgres -d records -f /docker-entrypoint-initdb.d/00-init.sql || true
-docker compose exec -T db psql -U postgres -d records -f /app/db-dumps/records_sample.sql || true
-
-# health
-curl -s http://127.0.0.1:8888/healthz
-# Access at http://your-synology-ip:8888
-```
-
-## Development Setup
-
-```sh
-# Clone repository
-git clone https://github.com/48lakes/records.git
-cd records
-
-# Create environment file
-cp .env.template .env.runtime
-# Edit .env.runtime with your tokens and passwords
-
-# Create required directories
-mkdir -p artwork thumbs static pgdata
-
-# Start services
-docker compose up -d --build
-
-# Check logs
-docker logs -f records_api
-docker logs -f records_db
-
-# Access application
-open http://localhost:8888
-```
 
 ## Architecture
 
-```
-┌─────────────────┐    ┌─────────────────┐
-│   Frontend      │    │   Backend       │
-│   Static Files  │───▶│   FastAPI       │
-│   - app.js      │    │   - main.py     │
-│   - styles.css  │    │   - crud.py     │
-│   - index.html  │    │   - models.py   │
-└─────────────────┘    └─────────────────┘
-                                │
-                       ┌─────────────────┐
-                       │   Database      │
-                       │   PostgreSQL 16 │
-                       │   - records     │
-                       │   - artwork     │
-                       └─────────────────┘
-```
+- Backend: FastAPI (`app/main.py`), SQLAlchemy models (`app/models.py`), CRUD (`app/crud.py`).
+- Database: PostgreSQL 16 (Docker). Schema bootstrap in `db-init/*.sql`; runtime guards in `ensure_schema()`.
+- Frontend: Static assets in `app/static` (`index.html`, `app.js`, `styles.css`).
+- Integrations: Discogs (`app/discogs_client.py`), MusicBrainz/Cover Art (`app/artwork.py`), Plex (`app/plex.py`), BluOS (`app/bluos.py`), local library indexer (`app/local_media.py`).
+- Media processing: Pillow for images, ffmpeg for HLS, mutagen for durations.
+- Containers: `Dockerfile`, `docker-compose.yml` (ports, volumes, healthchecks).
 
-## API Endpoints
+### Diagram
 
-- **GET** `/` → Main UI application
-- **GET** `/healthz` → Health check with database and Discogs status
-- **GET** `/records/all` → All records with sorting/filtering
-- **GET** `/formats` → Available record formats
-- **POST** `/sync/start` → Start Discogs collection sync
-- **GET** `/sync/status` → Current sync progress
-- **POST** `/artwork/search/musicbrainz` → Search MusicBrainz for artwork
-- **POST** `/artwork/search/discogs` → Search Discogs for artwork
+The system runs two containers (API + Postgres) and integrates with external services. Edit the source at `docs/architecture.mmd`.
 
-## UI Views
+```mermaid
+flowchart LR
+    subgraph Compose[Docker Compose]
+        API[FastAPI (uvicorn)\napp/main.py]
+        DB[(PostgreSQL 16)]
+        STATIC[/app/static\n(artwork, thumbs, js, css)/]
+        MUSIC[/MUSIC_ROOT (host)\nmounted read-only/]
+        API --- DB
+        API --- STATIC
+        API --- FF[ffmpeg\n(HLS transcode)]
+        MUSIC -. scan/stream .- API
+    end
 
-### Grid View (200x200 artwork)
-- Clean grid layout with album artwork
-- Title, artist, and year displayed below artwork
-- Click artwork placeholder to search for missing artwork
-- Responsive grid adapts to screen size
+    BROWSER[Browser UI]
+    DISC[Discogs API]
+    MB[MusicBrainz]
+    CAA[Cover Art Archive]
+    PLEX[Plex Server]
+    BLUOS[BluOS Player]
 
-### List View (125x125 artwork)
-- Detailed list with larger artwork thumbnails
-- Shows format, label, genre, style for each record
-- Compact layout with hover effects
-- Year displayed in separate column
-
-### Features
-- **Real-time search** - Filter by artist or album title
-- **Format filtering** - Show only specific formats (Vinyl, CD, etc.)
-- **Sorting options** - By artist, album, or year (ascending/descending)
-- **Artwork management** - Search and replace missing artwork
-- **Responsive design** - Works on desktop and mobile
-
-## Database Schema
-
-```sql
--- Core records table
-CREATE TABLE records (
-    id SERIAL PRIMARY KEY,
-    discogs_id INTEGER UNIQUE,
-    title VARCHAR(500),
-    artist_name VARCHAR(500),
-    year INTEGER,
-    label VARCHAR(500),
-    country VARCHAR(100),
-    format VARCHAR(100),
-    genre VARCHAR(200),
-    style VARCHAR(200),
-    cover_art_url VARCHAR(1000),
-    cover_thumb_url VARCHAR(1000),
-    artwork_url VARCHAR(1000),
-    mb_release_group_id VARCHAR(100),
-    artist_id INTEGER
-);
+    BROWSER <--> API
+    API --> DISC
+    API --> MB
+    API --> CAA
+    API --> PLEX
+    API --> BLUOS
 ```
 
-## File Structure
 
-```
-records/
-├── app/
-│   ├── main.py              # FastAPI application
-│   ├── crud.py              # Database operations
-│   ├── models.py            # SQLAlchemy models
-│   └── static/
-│       ├── index.html       # Main UI
-│       ├── app.js           # Frontend JavaScript
-│       ├── styles.css       # Dark theme CSS
-│       ├── sync.js          # Sync functionality
-│       ├── artwork/         # Full-size artwork (ignored by git)
-│       └── thumbs/          # 150x150 thumbnails (ignored by git)
-├── docker-compose.yml       # Container orchestration
-├── Dockerfile              # API container definition
-├── requirements.txt        # Python dependencies
-├── .env.runtime           # Environment variables (ignored by git)
-├── .gitignore             # Git exclusions
-├── milestone.sh           # Milestone management script
-└── README.md              # This file
-```
+## Quick Start (Docker Compose)
 
-## Milestone Management
+1) Create `.env.runtime` (not committed):
 
-This project uses git tags for milestone management to ensure safe development with rollback capability.
-
-### Create New Milestone
-```sh
-# When you reach a stable working state
-./milestone.sh create <milestone-name> "<description>"
-
-# Example
-./milestone.sh create overlay-enhanced "MILESTONE: Enhanced overlay with full details"
-```
-
-### List Available Milestones
-```sh
-./milestone.sh list
-```
-
-### Return to Previous Working State
-```sh
-# If something breaks, restore to last working state
-./milestone.sh restore <milestone-name>
-
-# Example
-./milestone.sh restore artwork-ui-complete
-```
-
-### Compare Changes
-```sh
-# See what changed since a milestone
-./milestone.sh diff <milestone-name>
-
-# Example
-./milestone.sh diff artwork-ui-complete
-```
-
-### Current Milestones
-
-- **`milestone-artwork-ui-complete`** - Complete artwork UI with enhanced list view
-  - 751 records loading successfully
-  - Grid view: 200x200 artwork display
-  - List view: 125x125 artwork + detailed info (format, label, genre, style)
-  - Artwork editing with MusicBrainz/Discogs search
-  - Responsive dark theme, view switching, search/filter
-  - No JavaScript console errors, stable checkpoint
-
-### Milestone Workflow
-
-1. **Work normally** - Regular commits as you develop
-2. **Reach stable state** - All features working, no errors
-3. **Create milestone** - `./milestone.sh create <name> "<description>"`
-4. **Continue development** - Keep working on new features
-5. **If something breaks** - `./milestone.sh restore <last-working-milestone>`
-6. **Safe experimentation** - Always have a reliable fallback
-
-## Development Workflow
+Copy from the provided template and edit values:
 
 ```sh
-# 1. Start development
-docker compose up -d
-
-# 2. Make changes to code
-# Edit files in app/ directory
-
-# 3. Test changes
-# Refresh browser at http://localhost:8888
-
-# 4. Regular commits
-git add .
-git commit -m "Add feature X"
-
-# 5. Reach stable milestone
-./milestone.sh create feature-complete "MILESTONE: Feature X working perfectly"
-
-# 6. Continue development or restore if needed
-./milestone.sh restore feature-complete  # if something breaks
+cp .env.template .env.runtime
+# Windows (PowerShell)
+copy .env.template .env.runtime
 ```
-
-## Environment Variables
 
 ```env
-# Required for Discogs API
 DATABASE_URL=postgresql+psycopg2://records:records@db:5432/records
-DISCOGS_TOKEN=YOUR_DISCOGS_TOKEN
-DISCOGS_USERNAME=YOUR_DISCOGS_USERNAME
+
+# Discogs API (required for collection sync)
+DISCOGS_TOKEN=your_token
+DISCOGS_USERNAME=your_discogs_username
 DISCOGS_USER_AGENT=records-app/1.0 (+you@example.com)
 
-# Optional services
-PLEX_URL=
-PLEX_TOKEN=
+# Optional: Plex integration
+PLEX_URL=http://127.0.0.1:32400
+PLEX_TOKEN=your_plex_token
+PLEX_SECTION_ID=4
 
-# Optional: MusicBrainz rate limiting
-MUSICBRAINZ_RATE_LIMIT=1.0
+# Optional: BluOS integration
+BLUOS_HOST=192.168.1.50
+BLUOS_PORT=11000
+BLUOS_LIBRARY_ROOT=/var/mnt/MUSIC  # folder as seen from BluOS player
+
+# Optional: local library and public base URL
+MUSIC_ROOT=/mnt/music              # mounted into container
+APP_PUBLIC_BASE_URL=http://LAN-IP:8888
 ```
+
+2) Start services:
+
+```sh
+docker compose --env-file .env.runtime up -d --build
+```
+
+3) Open the app: http://localhost:8888
+
+Notes
+- Compose maps `./app/static` into the container so artwork (`artwork/`) and thumbnails (`thumbs/`) persist on host.
+- DB is initialized by `db-init/` SQL; user/db `records` is created on first start.
+
+
+## Local Development (without Docker)
+
+```sh
+python -m venv .venv
+. .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+export DATABASE_URL=postgresql+psycopg2://records:records@127.0.0.1:5432/records
+export DISCOGS_TOKEN=...
+export DISCOGS_USERNAME=...
+export DISCOGS_USER_AGENT="records-app/1.0 (+you@example.com)"
+export APP_HOST=127.0.0.1 APP_PORT=8888
+
+uvicorn app.main:app --host $APP_HOST --port $APP_PORT --reload
+```
+
+Ensure you have a running PostgreSQL with the `records` database and `records` role (see `db-init/`). ffmpeg must be available on PATH for HLS features.
+
+
+## UI Overview
+
+- Grid view (200px) and List view (125px): toggle via toolbar.
+- Sort: by artist, album, or year (asc/desc), with tie‑breakers.
+- Multi‑select Format filter (Vinyl/CD/Cassette…); supports CSV via API.
+- Search: real‑time by artist or album title.
+- Overlay: artwork editor (search via MusicBrainz/Discogs, upload URL/file, remove/replace), tracklist display.
+- Sync panel: unified control for Discogs/BluOS sync + inline progress logs.
+
+
+## Major Workflows
+
+1) Sync collection (Discogs)
+- Start full sync: POST `/sync` (UI: Sync Collection). Imports/updates records via `discogs_client`.
+- New‑only sync: POST `/sync/new-only` to stop early when only known pages are found.
+- Partial/targeted: POST `/sync/partial` to enrich only missing/untouched fields.
+- Progress and logs: GET `/sync/status`, `/sync/progress`, `/sync/logs`.
+
+2) Artwork enrichment and management
+- Auto‑enrich per record using MusicBrainz release‑group search + Cover Art Archive download.
+- Manual search: POST `/artwork/search/musicbrainz` or `/artwork/search/discogs`.
+- Validate/set/upload/remove: `/artwork/validate-url`, `/artwork/set`, `/artwork/upload`, `/artwork/remove`.
+- Files saved to `app/static/artwork` (full) and `app/static/thumbs` (150px). URLs are served under `/static/...`.
+
+3) Tracklists
+- GET `/records/{id}/tracklist`: derive from local library (preferred), Discogs, or Plex if configured.
+- POST `/records/{id}/tracklist`: save/replace tracks for a record (stored in `tracks` table).
+- Local indexer: `app/local_media.py` scans `MUSIC_ROOT` folders to find albums and parse common filename patterns.
+
+4) Playback helpers
+- Local audio: GET `/local/stream?p=<relpath>` with Range support. HLS start at `/local/hls/start?p=...` (ffmpeg).
+- Plex audio: direct proxy `/plex/stream/{rating_key}` or HLS via `/plex/hls/start/{rating_key}`.
+- BluOS: control endpoints for play/pause/stop/seek, volume, presets, browse, and play URL. See `/bluos/*`.
+
+5) BluOS mapping sync (optional)
+- Requirements: `BLUOS_HOST`, `BLUOS_LIBRARY_ROOT`, and a populated local index (`MUSIC_ROOT`).
+- Process: `app/bluos_sync.py` browses the corresponding LocalMusic folders and stores a normalized title→playURL map per record in table `bluos_maps` with a simple match score.
+
+
+## API Surface (grouped)
+
+- UI and health
+  - GET `/` (index.html)
+  - GET `/healthz` (static health JSON)
+- Records
+  - GET `/records/all` (paging/sorting/filtering via query), GET `/formats`
+  - POST `/records/{id}/update`, GET/POST `/records/{id}/tracklist`, POST `/collection/reset`
+- Sync
+  - POST `/sync`, `/sync/new-only`, `/sync/partial`, `/sync/reset`, `/sync/discogs`, `/sync/bluos`, `/sync/cancel`
+  - GET `/sync/status`, `/sync/progress`, `/sync/logs`, `/sync/logs/clear`, `/sync/count`
+- Artwork
+  - POST `/artwork/search/musicbrainz`, `/artwork/search/discogs`, `/artwork/search/*-flexible`
+  - POST `/artwork/validate-url`, `/artwork/set`, `/artwork/upload`, `/artwork/remove`
+  - GET `/artwork/{filename}` (serve stored images)
+- Local media
+  - GET `/local/ping`, `/local/album/{record_id}`, `/local/stream`, `/local/hls/*`, POST `/local/scan`
+- Plex
+  - GET `/plex/ping`, `/plex/album/{record_id}`, `/plex/stream/{rating_key}`, `/plex/hls/*`
+- BluOS
+  - GET `/bluos/ping`, `/bluos/status`, `/bluos/presets`, `/bluos/resolve/album/{record_id}`, `/bluos/map/{record_id}`
+  - POST `/bluos/transport`, `/bluos/volume`, `/bluos/preset`, `/bluos/play-url`, `/bluos/play-plex/{rating_key}`, `/bluos/play-local`, `/bluos/action`
+
+
+## Data Model (key tables)
+
+- `records`: discogs_id, title, artist_name, artist_display_name, year, original_year, edition_year, label, country, format, genre, style, date_added, mb_release_group_id, cover_art_url, cover_thumb_url, artwork_url, artist_id, user_modified_at, last_synced_at.
+- `tracks`: record_id (FK), position, title, duration, track_order, created_at.
+- `bluos_maps`: record_id (PK), folder, play_map (JSONB), matched, match_score, updated_at.
+
+Schema evolves via `db-init/*.sql` and guarded additions in `ensure_schema()` on startup.
+
+
+## Configuration
+
+Environment variables (see `.env.runtime`):
+
+- Database: `DATABASE_URL`
+- Discogs: `DISCOGS_TOKEN`, `DISCOGS_USERNAME`, `DISCOGS_USER_AGENT`
+- Local media: `MUSIC_ROOT`
+- Public base URL: `APP_PUBLIC_BASE_URL` (used to produce absolute URLs for players)
+- Plex: `PLEX_URL`, `PLEX_TOKEN`, `PLEX_SECTION_ID`
+- BluOS: `BLUOS_HOST`, `BLUOS_PORT`, `BLUOS_LIBRARY_ROOT`
+
+Security and persistence
+- Secrets must not be committed. `.env.runtime` is git‑ignored.
+- Artwork and thumbs live under `app/static/` (bind‑mounted by compose).
+- HLS segments are written under the system temp dir (e.g., `/tmp/hls`).
+
+
+## Milestones & Release Workflow
+
+Use `milestone.sh` to tag stable states and allow quick restore.
+
+```sh
+./milestone.sh create <name> "Milestone: <description>"
+./milestone.sh list
+./milestone.sh diff <name>
+./milestone.sh restore <name>
+```
+
+Tags are created as `milestone-<name>` and pushed to `origin`. Restore performs a hard reset of `main` to the tag.
+
 
 ## Troubleshooting
 
-### Common Issues
+- Database
+  - `docker compose logs db` and `psql -U postgres -d records -c "SELECT COUNT(*) FROM records;"`
+- Discogs auth
+  - `curl -H "Authorization: Discogs token=..." https://api.discogs.com/oauth/identity`
+- Artwork paths
+  - Verify files in `app/static/artwork` and `app/static/thumbs`; check `/static/...` URLs
+- ffmpeg/HLS
+  - Ensure `ffmpeg` exists in container/host; inspect `/local/hls/start?p=...` response
+- Plex
+  - Check `PLEX_URL`/`PLEX_TOKEN`; test `/plex/ping`
+- BluOS
+  - Check `BLUOS_HOST`/`BLUOS_PORT`; test `/bluos/ping` and `/bluos/status`
 
-**No records loading:**
+Reset (destructive)
 ```sh
-# Check database connection
-docker logs records_db
-docker exec -it records_db psql -U postgres -d records -c "SELECT COUNT(*) FROM records;"
-```
-
-**Artwork not displaying:**
-```sh
-# Check artwork files exist
-docker exec -it records_api ls -la /app/app/static/artwork/ | head -5
-curl -I "http://localhost:8888/static/artwork/31464128.jpg"
-```
-
-**Sync not working:**
-```sh
-# Check Discogs token
-curl -H "Authorization: Discogs token=YOUR_TOKEN" https://api.discogs.com/oauth/identity
-```
-
-### Reset Everything
-```sh
-# Stop containers
 docker compose down
-
-# Remove data (WARNING: destroys database)
-docker volume rm records_pgdata
-
-# Restart fresh
+rm -rf pgdata
 docker compose up -d --build
 ```
 
-## Next Steps
 
-- [ ] Enhanced overlay with full record details
-- [ ] Advanced search with multiple filters
-- [ ] Bulk artwork operations
-- [ ] Export functionality
-- [ ] Collection statistics and insights
-- [ ] User preferences and settings
+## Credits & Licenses
 
-## Do not commit secrets
-- `.env.runtime`, dumps, overrides are ignored by `.gitignore`.
+- Code: Original work for this project. No third‑party source files were copied into the codebase.
+- APIs: Discogs, MusicBrainz, Cover Art Archive, Plex, and BluOS are used via their public HTTP APIs.
+- Docs: `docs/BluOS-Custom-Integration-API_v1.7.pdf` and `docs/bluos_api_v1_7.txt` are vendor documentation included for reference.
+- Libraries: FastAPI, SQLAlchemy, psycopg2, httpx, requests, Pillow, mutagen. ffmpeg is used for HLS.
+
+If you identify any snippet that should carry attribution, please open an issue with the file and line reference.
+
 
 ## License
 
-Personal project -
+Personal project — all rights reserved unless otherwise noted.

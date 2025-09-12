@@ -14,10 +14,13 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: "8888"
       DATABASE_URL: postgresql+psycopg2://records:records@db:5432/records
+      # Optional: default music root inside container (can be overridden in .env.runtime)
+      MUSIC_ROOT: /mnt/music
     volumes:
-      - ./static:/app/static
-      - ./artwork:/app/app/static/artwork
-      - ./thumbs:/app/app/static/thumbs
+      # Mount the app's static directory (includes css/js, artwork, thumbs, uploads)
+      - ./app/static:/app/app/static
+      # Optional: mount a host music folder to /mnt/music (readonly). Adjust host path.
+      - /volume1/MUSIC/FLAC:/mnt/music:ro
     networks:
       - records_net
 

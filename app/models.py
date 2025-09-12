@@ -19,18 +19,26 @@ class Record(Base):
     discogs_id = mapped_column(Integer, unique=True, index=True)
     title = mapped_column(String, index=True)
     artist_name = mapped_column(String, index=True)  # Note: artist_name, not artist
+    artist_display_name = mapped_column(String, nullable=True, index=True)
     year = mapped_column(Integer)
+    # New optional fields for more precise sorting
+    original_year = mapped_column(Integer, nullable=True)
+    edition_year = mapped_column(Integer, nullable=True)
     label = mapped_column(String)
     country = mapped_column(String)
     format = mapped_column(String)
     genre = mapped_column(String)
     style = mapped_column(String)
+    date_added = mapped_column(String, nullable=True)
     mb_release_group_id = mapped_column(String)
     cover_art_url = mapped_column(String)
     cover_thumb_url = mapped_column(String)
     artist_id = mapped_column(Integer)
     # catalog_number = mapped_column(String)  # This column doesn't exist in your DB
     artwork_url = mapped_column(String)  # This was added successfully
+    # Tracking columns
+    user_modified_at = mapped_column(DateTime, nullable=True)
+    last_synced_at = mapped_column(DateTime, nullable=True)
     
     # Add this relationship
     tracks = relationship("Track", back_populates="record", cascade="all, delete-orphan")
