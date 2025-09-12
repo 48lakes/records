@@ -1,17 +1,17 @@
-# Records — Beta
+﻿# Records â€” Beta
 
-A self‑hosted, single‑page app for browsing a Discogs‑backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
+A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
 
 
 ## Highlights
 
-- Full‑collection UI: grid and list views with search, sort, and multi‑format filters.
-- Discogs sync: imports your collection with pagination handling and de‑duplication.
+- Fullâ€‘collection UI: grid and list views with search, sort, and multiâ€‘format filters.
+- Discogs sync: imports your collection with pagination handling and deâ€‘duplication.
 - Artwork enrichment: MusicBrainz + Cover Art Archive lookups with local caching and thumbnails.
 - Playback helpers: local file streaming (Range + HLS via ffmpeg) and Plex proxy/HLS.
 - BluOS integration: browse folder mappings and trigger playback on a player.
 - Tracklists: derive/save tracklists from Discogs, Plex, or local library; stored per record.
-- Dark theme: responsive, keyboard‑friendly UI; no external JS frameworks.
+- Dark theme: responsive, keyboardâ€‘friendly UI; no external JS frameworks.
 
 
 ## Architecture
@@ -30,13 +30,13 @@ The system runs two containers (API + Postgres) and integrates with external ser
 ```mermaid
 flowchart LR
     subgraph Compose[Docker Compose]
-        API[FastAPI (uvicorn)\napp/main.py]
+        API[FastAPI (uvicorn)<br/>app/main.py]
         DB[(PostgreSQL 16)]
-        STATIC[/app/static\n(artwork, thumbs, js, css)/]
-        MUSIC[/MUSIC_ROOT (host)\nmounted read-only/]
+        STATIC[/app/static<br/>(artwork, thumbs, js, css)/]
+        MUSIC[/MUSIC_ROOT (host)<br/>mounted read-only/]
         API --- DB
         API --- STATIC
-        API --- FF[ffmpeg\n(HLS transcode)]
+        API --- FF[ffmpeg<br/>(HLS transcode)]
         MUSIC -. scan/stream .- API
     end
 
@@ -126,9 +126,9 @@ Ensure you have a running PostgreSQL with the `records` database and `records` r
 ## UI Overview
 
 - Grid view (200px) and List view (125px): toggle via toolbar.
-- Sort: by artist, album, or year (asc/desc), with tie‑breakers.
-- Multi‑select Format filter (Vinyl/CD/Cassette…); supports CSV via API.
-- Search: real‑time by artist or album title.
+- Sort: by artist, album, or year (asc/desc), with tieâ€‘breakers.
+- Multiâ€‘select Format filter (Vinyl/CD/Cassetteâ€¦); supports CSV via API.
+- Search: realâ€‘time by artist or album title.
 - Overlay: artwork editor (search via MusicBrainz/Discogs, upload URL/file, remove/replace), tracklist display.
 - Sync panel: unified control for Discogs/BluOS sync + inline progress logs.
 
@@ -137,12 +137,12 @@ Ensure you have a running PostgreSQL with the `records` database and `records` r
 
 1) Sync collection (Discogs)
 - Start full sync: POST `/sync` (UI: Sync Collection). Imports/updates records via `discogs_client`.
-- New‑only sync: POST `/sync/new-only` to stop early when only known pages are found.
+- Newâ€‘only sync: POST `/sync/new-only` to stop early when only known pages are found.
 - Partial/targeted: POST `/sync/partial` to enrich only missing/untouched fields.
 - Progress and logs: GET `/sync/status`, `/sync/progress`, `/sync/logs`.
 
 2) Artwork enrichment and management
-- Auto‑enrich per record using MusicBrainz release‑group search + Cover Art Archive download.
+- Autoâ€‘enrich per record using MusicBrainz releaseâ€‘group search + Cover Art Archive download.
 - Manual search: POST `/artwork/search/musicbrainz` or `/artwork/search/discogs`.
 - Validate/set/upload/remove: `/artwork/validate-url`, `/artwork/set`, `/artwork/upload`, `/artwork/remove`.
 - Files saved to `app/static/artwork` (full) and `app/static/thumbs` (150px). URLs are served under `/static/...`.
@@ -159,7 +159,7 @@ Ensure you have a running PostgreSQL with the `records` database and `records` r
 
 5) BluOS mapping sync (optional)
 - Requirements: `BLUOS_HOST`, `BLUOS_LIBRARY_ROOT`, and a populated local index (`MUSIC_ROOT`).
-- Process: `app/bluos_sync.py` browses the corresponding LocalMusic folders and stores a normalized title→playURL map per record in table `bluos_maps` with a simple match score.
+- Process: `app/bluos_sync.py` browses the corresponding LocalMusic folders and stores a normalized titleâ†’playURL map per record in table `bluos_maps` with a simple match score.
 
 
 ## API Surface (grouped)
@@ -207,8 +207,8 @@ Environment variables (see `.env.runtime`):
 - BluOS: `BLUOS_HOST`, `BLUOS_PORT`, `BLUOS_LIBRARY_ROOT`
 
 Security and persistence
-- Secrets must not be committed. `.env.runtime` is git‑ignored.
-- Artwork and thumbs live under `app/static/` (bind‑mounted by compose).
+- Secrets must not be committed. `.env.runtime` is gitâ€‘ignored.
+- Artwork and thumbs live under `app/static/` (bindâ€‘mounted by compose).
 - HLS segments are written under the system temp dir (e.g., `/tmp/hls`).
 
 
@@ -251,7 +251,7 @@ docker compose up -d --build
 
 ## Credits & Licenses
 
-- Code: Original work for this project. No third‑party source files were copied into the codebase.
+- Code: Original work for this project. No thirdâ€‘party source files were copied into the codebase.
 - APIs: Discogs, MusicBrainz, Cover Art Archive, Plex, and BluOS are used via their public HTTP APIs.
 - Docs: `docs/BluOS-Custom-Integration-API_v1.7.pdf` and `docs/bluos_api_v1_7.txt` are vendor documentation included for reference.
 - Libraries: FastAPI, SQLAlchemy, psycopg2, httpx, requests, Pillow, mutagen. ffmpeg is used for HLS.
@@ -261,4 +261,4 @@ If you identify any snippet that should carry attribution, please open an issue 
 
 ## License
 
-Personal project — all rights reserved unless otherwise noted.
+Personal project â€” all rights reserved unless otherwise noted.

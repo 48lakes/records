@@ -1,12 +1,12 @@
-flowchart LR
+﻿flowchart LR
     subgraph Compose[Docker Compose]
-        API[FastAPI (uvicorn)\napp/main.py]
+        API[FastAPI (uvicorn)<br/>app/main.py]
         DB[(PostgreSQL 16)]
-        STATIC[/app/static\n(artwork, thumbs, js, css)/]
-        MUSIC[/MUSIC_ROOT (host)\nmounted read-only/]
+        STATIC[/app/static<br/>(artwork, thumbs, js, css)/]
+        MUSIC[/MUSIC_ROOT (host)<br/>mounted read-only/]
         API --- DB
         API --- STATIC
-        API --- FF[ffmpeg\n(HLS transcode)]
+        API --- FF[ffmpeg<br/>(HLS transcode)]
         MUSIC -. scan/stream .- API
     end
 
@@ -23,4 +23,5 @@ flowchart LR
     API --> CAA
     API --> PLEX
     API --> BLUOS
+
 
