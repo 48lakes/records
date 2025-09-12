@@ -1,6 +1,6 @@
 ﻿# Records - Beta
 
-A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
+A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI [...]
 
 
 ## Highlights
@@ -30,22 +30,24 @@ The system runs two containers (API + Postgres) and integrates with external ser
 ```mermaid
 flowchart LR
     subgraph Compose[Docker Compose]
-        API[FastAPI (uvicorn)<br/>app/main.py]
-        DB[(PostgreSQL 16)]
-        STATIC[/app/static<br/>(artwork, thumbs, js, css)/]
-        MUSIC[/MUSIC_ROOT (host)<br/>mounted read-only/]
+        API["FastAPI (uvicorn)<br/>app/main.py"]
+        DB["PostgreSQL 16"]
+        STATIC["app/static<br/>(artwork, thumbs, js, css)"]
+        MUSIC["MUSIC_ROOT (host)<br/>mounted read-only"]
+        FF["ffmpeg<br/>(HLS transcode)"]
+
         API --- DB
         API --- STATIC
-        API --- FF[ffmpeg<br/>(HLS transcode)]
-        MUSIC -. scan/stream .- API
+        API --- FF
+        MUSIC -. "scan/stream" .- API
     end
 
-    BROWSER[Browser UI]
-    DISC[Discogs API]
-    MB[MusicBrainz]
-    CAA[Cover Art Archive]
-    PLEX[Plex Server]
-    BLUOS[BluOS Player]
+    BROWSER["Browser UI"]
+    DISC["Discogs API"]
+    MB["MusicBrainz"]
+    CAA["Cover Art Archive"]
+    PLEX["Plex Server"]
+    BLUOS["BluOS Player"]
 
     BROWSER <--> API
     API --> DISC
@@ -54,7 +56,6 @@ flowchart LR
     API --> PLEX
     API --> BLUOS
 ```
-
 
 ## Quick Start (Docker Compose)
 
@@ -188,7 +189,7 @@ Ensure you have a running PostgreSQL with the `records` database and `records` r
 
 ## Data Model (key tables)
 
-- `records`: discogs_id, title, artist_name, artist_display_name, year, original_year, edition_year, label, country, format, genre, style, date_added, mb_release_group_id, cover_art_url, cover_thumb_url, artwork_url, artist_id, user_modified_at, last_synced_at.
+- `records`: discogs_id, title, artist_name, artist_display_name, year, original_year, edition_year, label, country, format, genre, style, date_added, mb_release_group_id, cover_art_url, cover_thumb_u[...]
 - `tracks`: record_id (FK), position, title, duration, track_order, created_at.
 - `bluos_maps`: record_id (PK), folder, play_map (JSONB), matched, match_score, updated_at.
 
