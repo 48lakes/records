@@ -8,8 +8,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .bluos import BluOSClient
-from .local_media import album_tracks as local_album_tracks
-from .plex import normalize_title
+from .local_media import album_tracks as local_album_tracks, album_tracks_from_folder, folder_for_album
+from .normalize import normalize_title
+from .crud import get_local_override
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +48,41 @@ def sync_bluos_for_collection(db: Session, progress_cb: Callable[[int, str], Non
         album = (row.get("title") or "").strip()
         try:
             # Derive the relative album folder based on local index
-            local_map = local_album_tracks(artist, album)
+            override_folder = get_local_override(db, rec_id)
+            sanitized_override = (override_folder or '').strip('/\\').replace('\\', '/') if override_folder else None
+
+            local_map = None
+            folder_rel = None
+            if sanitized_override:
+                local_map = album_tracks_from_folder(sanitized_override)
+                if local_map:
+                    folder_rel = sanitized_override
+
             if not local_map:
-                # No local mapping; skip
-                _store(db, rec_id, None, {}, False, 0)
+                local_map = local_album_tracks(artist, album)
+                if local_map:
+                    folder_rel = folder_rel or folder_for_album(artist, album)
+                    if not folder_rel:
+                        any_path = next((v.get('path') for v in local_map.values() if v.get('path')), None)
+                        if any_path:
+                            import os as _os
+                            folder_rel = _os.path.dirname(any_path).replace('\\', '/')
+                elif sanitized_override:
+                    folder_rel = sanitized_override
+
+            if not local_map:
+                remote_folder = f"{root}/{folder_rel}" if folder_rel else None
+                _store(db, rec_id, remote_folder, {}, False, 0)
                 done += 1
                 if progress_cb and total:
                     prog = min(99, int((done / total) * 100))
                     progress_cb(prog, f"BluOS: {done}/{total}")
                 continue
 
-            # Compute folder relative path from any track entry
-            any_rel = next(iter(local_map.values())).get("path")
+            any_rel = next((v.get('path') for v in local_map.values() if v.get('path')), None)
             if not any_rel:
-                _store(db, rec_id, None, {}, False, 0)
+                remote_folder = f"{root}/{folder_rel}" if folder_rel else None
+                _store(db, rec_id, remote_folder, {}, False, 0)
                 done += 1
                 if progress_cb and total:
                     prog = min(99, int((done / total) * 100))
@@ -68,7 +90,8 @@ def sync_bluos_for_collection(db: Session, progress_cb: Callable[[int, str], Non
                 continue
 
             import os as _os
-            folder_rel = _os.path.dirname(any_rel).replace("\\", "/")
+            if not folder_rel:
+                folder_rel = _os.path.dirname(any_rel).replace('\\', '/')
             remote_folder = f"{root}/{folder_rel}"
 
             # Browse this folder on BluOS
@@ -84,8 +107,8 @@ def sync_bluos_for_collection(db: Session, progress_cb: Callable[[int, str], Non
                     progress_cb(prog, f"BluOS: {done}/{total}")
                 continue
 
-            # Build normalized title -> playURL map from browse items
-            mapping: Dict[str, str] = {}
+            # Build normalized browse items list
+            browse_items: list[tuple[str, str]] = []  # (norm_title, playURL)
             for el in broot.iter():
                 if el.tag != 'item':
                     continue
@@ -93,17 +116,38 @@ def sync_bluos_for_collection(db: Session, progress_cb: Callable[[int, str], Non
                 if t not in ('audio', 'song', 'track', None):
                     continue
                 title = el.attrib.get('text') or ''
-                play = el.attrib.get('playURL') or el.attrib.get('actionURL') or ''
+                play = el.attrib.get('autoplayURL') or el.attrib.get('autoplayPath') or el.attrib.get('playURL') or el.attrib.get('actionURL') or ''
                 if title and play:
-                    mapping[normalize_title(title)] = play
+                    browse_items.append((normalize_title(title), play))
 
-            # Score: fraction of locally indexed tracks covered by BluOS mapping
+            # Exact map from browse titles
+            mapping_browse: Dict[str, str] = {k: v for (k, v) in browse_items}
+
+            # Fuzzy-align to local normalized titles
+            import difflib as _difflib
             local_titles = [normalize_title(k) for k in local_map.keys()]
-            covered = sum(1 for t in local_titles if t in mapping)
-            score = int(100 * covered / max(1, len(local_titles)))
-            matched = covered >= max(1, int(0.6 * len(local_titles)))
+            final_map: Dict[str, str] = {}
+            matched_count = 0
+            for lt in local_titles:
+                if lt in mapping_browse:
+                    final_map[lt] = mapping_browse[lt]
+                    matched_count += 1
+                    continue
+                # Fallback: best fuzzy match among browse items
+                best_play = None
+                best_ratio = 0.0
+                for bt, play in browse_items:
+                    r = _difflib.SequenceMatcher(None, lt, bt).ratio()
+                    if r > best_ratio:
+                        best_ratio, best_play = r, play
+                if best_play and best_ratio >= float(os.getenv("BLUOS_FUZZY_THRESHOLD", "0.8")):
+                    final_map[lt] = best_play
+                    matched_count += 1
 
-            _store(db, rec_id, remote_folder, mapping, matched, score)
+            score = int(100 * matched_count / max(1, len(local_titles)))
+            matched = matched_count >= max(1, int(0.6 * len(local_titles)))
+
+            _store(db, rec_id, remote_folder, final_map, matched, score)
         except Exception as e:
             logger.debug(f"BluOS map error for record {rec_id}: {e}")
             _store(db, rec_id, None, {}, False, 0)

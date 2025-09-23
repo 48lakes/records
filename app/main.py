@@ -10,6 +10,8 @@ from pydantic import BaseModel
 import logging
 import requests
 import os
+import json
+import re
 from urllib.parse import urlparse
 from PIL import Image
 from io import BytesIO
@@ -17,17 +19,33 @@ from datetime import datetime
 
 # Import your modules
 from .db import engine, get_db
-from .crud import list_records_all, get_record_tracks, save_record_tracks, fetch_and_store_tracklist, update_record_fields
+from .crud import (
+    list_records_all,
+    get_record_tracks,
+    save_record_tracks,
+    fetch_and_store_tracklist,
+    update_record_fields,
+    get_local_override,
+    set_local_override,
+    delete_local_override,
+    upsert_record,
+)
 from .importer import sync_discogs_collection, request_cancel, clear_cancel
-from .crud import upsert_record
 from .artwork import enrich_with_artwork
-from .plex import PlexClient, normalize_title
+from .sync_utils import discogs_payload_signature
+from .plex import PlexClient
+from .normalize import normalize_title, sanitize_for_local, fold_to_ascii
 from .bluos import BluOSClient
 from .local_media import (
     scan_library as local_scan,
     album_tracks as local_album_tracks,
     album_track_list as local_album_track_list,
+    album_tracks_from_folder as local_album_tracks_from_folder,
+    album_track_list_from_folder as local_album_track_list_from_folder,
+    folder_for_album as local_folder_for_album,
+    search_albums as local_search_albums,
     get_track_duration_seconds,
+    read_metadata as local_read_metadata,
     format_duration,
     build_stream_url as local_stream_url,
     set_music_root as local_set_root,
@@ -65,6 +83,10 @@ def ensure_schema():
             # Add sync/edit tracking columns
             conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS user_modified_at TIMESTAMP NULL"))
             conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP NULL"))
+            conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS discogs_payload_hash TEXT"))
+            conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS discogs_payload JSONB"))
+            conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS artwork_synced_at TIMESTAMP NULL"))
+            conn.execute(text("ALTER TABLE records ADD COLUMN IF NOT EXISTS artwork_source_url TEXT"))
             # BluOS mapping storage (separate table)
             conn.execute(text(
                 """
@@ -74,6 +96,16 @@ def ensure_schema():
                     play_map JSONB,
                     matched BOOLEAN,
                     match_score INTEGER,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS local_album_overrides (
+                    record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+                    folder TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
                 """
@@ -104,7 +136,12 @@ except Exception:
 sync_state = {
     "status": "not_started",  # not_started, running, completed, error
     "progress": 0,
-    "message": ""
+    "message": "",
+    "recent_items": [],
+    "stats": {"updated": 0, "unchanged": 0},
+    "current": 0,
+    "total": 0,
+    "last_item": None,
 }
 
 # In-memory sync logs (per run)
@@ -124,6 +161,60 @@ def add_sync_log(message: str, level: str = "info"):
     sync_log_next_id += 1
     sync_logs.append(entry)
 
+
+def _to_int(val):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_local_album(db: Session, record_id: int, artist: str, title: str) -> dict:
+    artist = (artist or '').strip()
+    title = (title or '').strip()
+    artist_lookup = sanitize_for_local(artist) or artist
+    title_lookup = fold_to_ascii(title).strip() or title
+    override_folder = get_local_override(db, record_id)
+    sanitized_override = (override_folder or '').strip() if override_folder else None
+    if sanitized_override:
+        sanitized_override = sanitized_override.strip('/\\').replace('\\', '/')
+    ctx = {
+        'tracks': None,
+        'folder': sanitized_override,
+        'source': 'auto',
+        'override': sanitized_override,
+        'override_requested': bool(sanitized_override),
+        'override_active': False,
+    }
+    tracks = None
+    chosen_folder = sanitized_override
+    if sanitized_override:
+        tracks = local_album_track_list_from_folder(sanitized_override)
+        if tracks:
+            ctx['source'] = 'manual'
+            ctx['override_active'] = True
+        else:
+            ctx['source'] = 'manual'
+    if not tracks and artist_lookup and title_lookup:
+        tracks = local_album_track_list(artist_lookup, title_lookup)
+        if not tracks and (artist_lookup != artist or title_lookup != title):
+            tracks = local_album_track_list(artist, title)
+        if tracks:
+            auto_folder = local_folder_for_album(artist_lookup, title_lookup)
+            if not auto_folder:
+                auto_folder = local_folder_for_album(artist, title)
+            if not auto_folder:
+                any_rel = next((t.get('relpath') for t in tracks if t.get('relpath')), None)
+                if any_rel:
+                    auto_folder = os.path.dirname(any_rel).replace('\\', '/')
+            chosen_folder = auto_folder or chosen_folder
+            if not ctx['override_active']:
+                ctx['source'] = 'auto'
+    ctx['tracks'] = tracks
+    ctx['folder'] = chosen_folder
+    ctx['override_missing'] = ctx['override_requested'] and not ctx['override_active']
+    return ctx
+
 # Pydantic models
 class ArtworkSearchRequest(BaseModel):
     artist: str
@@ -134,6 +225,53 @@ class SetArtworkRequest(BaseModel):
     record_id: int
     artwork_url: str
     source: str
+
+class LocalAlbumMapRequest(BaseModel):
+    folder: str
+
+
+
+def _build_artwork_headers(url: str) -> dict[str, str]:
+    """Return headers for external artwork requests with Discogs support."""
+    headers: dict[str, str] = {}
+    ua = os.getenv('DISCOGS_USER_AGENT')
+    headers['User-Agent'] = ua if ua else 'records-app/1.0 (+local)'
+    try:
+        parsed = urlparse(url or '')
+        host = (parsed.hostname or '').lower()
+    except Exception:
+        host = ''
+    headers.setdefault('Accept', 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8')
+    if host.endswith('discogs.com') or host.endswith('discogs.net') or '.discogs.com' in host:
+        headers.setdefault('Referer', 'https://www.discogs.com/')
+        token = os.getenv('DISCOGS_TOKEN')
+        if token:
+            headers.setdefault('Authorization', f'Discogs token={token}')
+    return headers
+
+
+def _extract_dimensions_from_url(url: str) -> tuple[int | None, int | None]:
+    if not url:
+        return None, None
+    match = re.search(r'-(\d+)(?:x(\d+))?\.(?:jpe?g|png)$', url)
+    if match:
+        width = int(match.group(1))
+        height = int(match.group(2)) if match.group(2) else width
+        return width, height
+    return None, None
+
+
+def _format_bytes(num: int | None) -> str | None:
+    if num is None:
+        return None
+    step = float(num)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if step < 1024 or unit == 'TB':
+            if unit == 'B':
+                return f"{int(step)} {unit}"
+            return f"{step:.1f} {unit}"
+        step /= 1024
+    return None
 
 class UpdateRecordRequest(BaseModel):
     artist_name: str | None = None
@@ -182,13 +320,64 @@ def _public_base_url(request: Request) -> str:
 
 def update_sync_progress(progress: int, message: str = ""):
     """Update sync progress state"""
-    sync_state.update({
-        "progress": progress,
-        "message": message
-    })
+    sync_state["progress"] = progress
+
+    structured = False
+    log_message = None
+    friendly_message = message or ""
+
+    if message and "|" in message:
+        parts = message.split("|")
+        if len(parts) >= 6 and parts[0] in {"UPDATED", "UNCHANGED"}:
+            structured = True
+            status_key = "updated" if parts[0] == "UPDATED" else "unchanged"
+            discogs_id_raw = parts[1]
+            title = parts[2]
+            artist = parts[3]
+            current = _to_int(parts[4])
+            total = _to_int(parts[5])
+
+            discogs_id = _to_int(discogs_id_raw)
+            item = {
+                "discogs_id": discogs_id if discogs_id is not None else discogs_id_raw,
+                "title": title,
+                "artist": artist,
+                "status": status_key,
+                "index": current,
+                "total": total,
+            }
+
+            items = sync_state.setdefault("recent_items", [])
+            items.append(item)
+            if len(items) > 40:
+                del items[:-40]
+
+            stats = sync_state.setdefault("stats", {"updated": 0, "unchanged": 0})
+            stats[status_key] = stats.get(status_key, 0) + 1
+
+            if current is not None:
+                sync_state["current"] = current
+            if total is not None:
+                sync_state["total"] = total
+            sync_state["last_item"] = item
+
+            display_parts = [p for p in (artist, title) if p]
+            if display_parts:
+                display_text = " - ".join(display_parts)
+            elif discogs_id_raw:
+                display_text = f"Discogs #{discogs_id_raw}"
+            else:
+                display_text = "Record"
+            friendly_message = f"{'Updated' if status_key == 'updated' else 'Unchanged'} • {display_text}"
+            log_message = friendly_message
+
+    sync_state["message"] = friendly_message
+    if not structured and message:
+        log_message = message
+
     try:
-        if message:
-            add_sync_log(message, level="info")
+        if log_message:
+            add_sync_log(log_message, level="info")
     except Exception:
         pass
 
@@ -203,6 +392,11 @@ async def run_sync(db: Session):
             "progress": 0,
             "message": "Starting sync..."
         })
+        sync_state["recent_items"] = []
+        sync_state["stats"] = {"updated": 0, "unchanged": 0}
+        sync_state["current"] = 0
+        sync_state["total"] = 0
+        sync_state["last_item"] = None
         clear_cancel()
         if inspect.iscoroutinefunction(sync_discogs_collection):
             await sync_discogs_collection(db, update_sync_progress)
@@ -292,6 +486,7 @@ async def run_sync_new_only(db: Session):
                     "cover_thumb_url": None,
                     "artist_id": None
                 }
+                snapshot, payload_hash = discogs_payload_signature(rec)
                 # Enrich artwork
                 try:
                     import asyncio
@@ -299,6 +494,13 @@ async def run_sync_new_only(db: Session):
                     rec = loop.run_until_complete(enrich_with_artwork(rec))
                 except RuntimeError:
                     pass
+                refreshed = rec.pop("_artwork_refreshed", None)
+                if refreshed:
+                    rec["artwork_synced_at"] = datetime.utcnow()
+                else:
+                    rec["artwork_synced_at"] = None
+                rec["discogs_payload"] = json.dumps(snapshot, sort_keys=True)
+                rec["discogs_payload_hash"] = payload_hash
                 upsert_record(db, rec)
                 db.commit()
                 processed += 1
@@ -331,6 +533,29 @@ async def read_root():
 def _bluos_client() -> BluOSClient:
     return BluOSClient()
 
+def _maybe_clear_before_play(c: BluOSClient) -> None:
+    """Optionally clear the player's queue before starting new playback.
+    Controlled by env var BLUOS_CLEAR_BEFORE_PLAY (default: '1').
+    Sleep BLUOS_CLEAR_SLEEP_MS (default: 250) to avoid races.
+    """
+    try:
+        enabled = (os.getenv("BLUOS_CLEAR_BEFORE_PLAY", "1").strip() or "1")
+        if enabled not in ("1", "true", "True", "yes", "on"):
+            return
+        c.clear()
+        try:
+            ms = int(os.getenv("BLUOS_CLEAR_SLEEP_MS", "250") or "250")
+        except Exception:
+            ms = 250
+        if ms > 0:
+            try:
+                time.sleep(min(2000, max(0, ms)) / 1000.0)
+            except Exception:
+                pass
+    except Exception:
+        # Non-fatal: ignore failures to clear
+        pass
+
 @app.get("/bluos/ping")
 def bluos_ping():
     try:
@@ -342,10 +567,17 @@ def bluos_ping():
         return {"ok": False, "error": str(e)}
 
 @app.get("/bluos/status")
-def bluos_status():
+def bluos_status(
+    timeout: int | None = Query(None, ge=1, le=120),
+    etag: str | None = Query(None),
+):
+    """Fetch BluOS status with optional long-poll parameters.
+
+    timeout is forwarded to the player; per spec it should be <= 100 seconds.
+    """
     try:
         c = _bluos_client()
-        root = c.status()
+        root = c.status(timeout=timeout, etag=etag)
         return BluOSClient.status_to_dict(root)
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -355,23 +587,41 @@ def bluos_transport(req: BluOSTransportRequest):
     try:
         c = _bluos_client()
         a = (req.action or "").lower()
+        last = None
         if a == "play":
-            root = c.play(seek=req.seek, track_id=req.track_id)
+            last = c.play(seek=req.seek, track_id=req.track_id)
         elif a == "pause":
-            root = c.pause(toggle=True if req.seek is None else False)
+            last = c.pause(toggle=True if req.seek is None else False)
         elif a == "stop":
-            root = c.stop()
+            last = c.stop()
         elif a == "skip":
-            root = c.skip()
+            last = c.skip()
         elif a == "back":
-            root = c.back()
+            last = c.back()
         elif a == "seek":
             if req.seek is None:
                 raise HTTPException(status_code=400, detail="seek is required for action=seek")
-            root = c.play(seek=req.seek)
+            last = c.play(seek=req.seek)
         else:
             raise HTTPException(status_code=400, detail="Unknown action")
-        return BluOSClient.status_to_dict(root)
+        # Give the player a brief moment to update state before querying status
+        delay_ms = 0
+        try:
+            delay_ms = int(os.getenv("BLUOS_STATUS_DELAY_MS", "0") or 0)
+        except Exception:
+            delay_ms = 0
+        if delay_ms > 0:
+            try:
+                time.sleep(min(delay_ms, 1000) / 1000.0)
+            except Exception:
+                pass
+        try:
+            status_root = c.status()
+            return BluOSClient.status_to_dict(status_root)
+        except Exception:
+            if last is not None:
+                return BluOSClient.status_to_dict(last)
+            raise
     except HTTPException:
         raise
     except Exception as e:
@@ -422,6 +672,8 @@ def bluos_preset(body: dict):
 def bluos_play_url(req: BluOSPlayUrlRequest):
     try:
         c = _bluos_client()
+        # Clear queue before starting new playback
+        _maybe_clear_before_play(c)
         root = c.play_url(req.url)
         return BluOSClient.status_to_dict(root)
     except Exception as e:
@@ -437,6 +689,8 @@ def bluos_play_plex(rating_key: str, request: Request):
         base = _public_base_url(request)
         abs_url = f"{base}/plex/stream/{rating_key}"
         c = _bluos_client()
+        # Clear queue before starting new playback
+        _maybe_clear_before_play(c)
         root = c.play_url(abs_url)
         return BluOSClient.status_to_dict(root)
     except Exception as e:
@@ -444,24 +698,83 @@ def bluos_play_plex(rating_key: str, request: Request):
 
 @app.post("/bluos/play-local")
 def bluos_play_local(req: BluOSPlayLocalRequest, request: Request):
-    """Ask BluOS to play a local file by pointing it to our /local/stream URL.
-    The player must be able to reach this server URL on the LAN.
+    """Play a local file on BluOS.
+
+    Prefers invoking the player's own Browse actionURL for the matching track (best metadata on device displays).
+    Falls back to LocalMusic: direct URL, then to HTTP stream via our /local/stream if no library root is set.
     """
     try:
         p = (req.path or "").replace("\\", "/")
         c = _bluos_client()
-        # Prefer LocalMusic direct playback if BLUOS_LIBRARY_ROOT is configured
         lm_root = (os.getenv("BLUOS_LIBRARY_ROOT") or "").strip().rstrip("/\\")
         if lm_root:
+            import os as _os, difflib as _difflib
             rel = p.lstrip("/\\")
             local_path = f"{lm_root}/{rel}"
-            raw_url = f"LocalMusic:{local_path}"
-            root = c.play_url(raw_url)
+            # Try to use Browse actionURL from parent folder for richer metadata
+            played_via_action = False
+            try:
+                remote_folder = _os.path.dirname(local_path).replace("\\", "/")
+                broot = c.browse(f"LocalMusic:{remote_folder}")
+                target_file = _os.path.basename(local_path).lower()
+                # First, attempt filename match via optional 'url' attribute
+                for el in broot.iter():
+                    if el.tag != 'item':
+                        continue
+                    t = el.attrib.get('type')
+                    if t not in ('audio', 'song', 'track', None):
+                        continue
+                    file_attr = (el.attrib.get('url') or '').lower()
+                    if file_attr and target_file and target_file in file_attr:
+                        play_url = el.attrib.get('autoplayURL') or el.attrib.get('autoplayPath') or el.attrib.get('playURL') or el.attrib.get('actionURL') or ''
+                        if play_url:
+                            _maybe_clear_before_play(c)
+                            c.call_action_path(play_url)
+                            played_via_action = True
+                            break
+                # If not found, fuzzy match by normalized title
+                if not played_via_action:
+                    from .normalize import normalize_title as _norm
+                    want = _norm(_os.path.splitext(target_file)[0])
+                    best_el = None
+                    best_ratio = 0.0
+                    for el in broot.iter():
+                        if el.tag != 'item':
+                            continue
+                        t = el.attrib.get('type')
+                        if t not in ('audio', 'song', 'track', None):
+                            continue
+                        txt = (el.attrib.get('text') or '').strip()
+                        if not txt:
+                            continue
+                        r = _difflib.SequenceMatcher(None, want, _norm(txt)).ratio()
+                        if r > best_ratio:
+                            best_ratio, best_el = r, el
+                    if best_el and best_ratio >= float(os.getenv("BLUOS_FUZZY_THRESHOLD", "0.8")):
+                        play_url = best_el.attrib.get('autoplayURL') or best_el.attrib.get('autoplayPath') or best_el.attrib.get('playURL') or best_el.attrib.get('actionURL') or ''
+                        if play_url:
+                            _maybe_clear_before_play(c)
+                            c.call_action_path(play_url)
+                            played_via_action = True
+            except Exception:
+                played_via_action = False
+
+            if played_via_action:
+                try:
+                    root = c.status()
+                except Exception:
+                    root = None
+            else:
+                # Fallback to direct LocalMusic URL
+                raw_url = f"LocalMusic:{local_path}"
+                _maybe_clear_before_play(c)
+                root = c.play_url(raw_url)
         else:
-            # Fallback: make player fetch stream from our server
+            # No library root: fallback to server HTTP stream
             base = _public_base_url(request)
             from urllib.parse import quote as _q
             abs_url = f"{base}/local/stream?p={_q(p, safe='')}"
+            _maybe_clear_before_play(c)
             root = c.play_url(abs_url)
         return BluOSClient.status_to_dict(root)
     except Exception as e:
@@ -486,28 +799,28 @@ def bluos_resolve_album(record_id: int, db: Session = Depends(get_db)):
         if not row:
             raise HTTPException(status_code=404, detail="Record not found")
 
-        # Try local index to get the actual folder path
-        tracks = local_album_tracks(row["artist"] or "", row["title"] or "")
-        if not tracks:
-            raise HTTPException(status_code=404, detail="Local album mapping not found; scan /local first")
-        # Use the first track to derive folder path
-        any_rel = next(iter(tracks.values())).get("path")
-        if not any_rel:
-            raise HTTPException(status_code=404, detail="No local relpath available")
-        # relpath like 'Artist/Album/Track.flac' -> folder 'Artist/Album'
-        folder_rel = os.path.dirname(any_rel).replace("\\", "/")
+
+        ctx = _resolve_local_album(db, record_id, row["artist"] or "", row["title"] or "")
+        track_list = ctx.get('tracks') if isinstance(ctx, dict) else None
+        if not track_list:
+            raise HTTPException(status_code=404, detail="Local album mapping not found; map local files first")
+        folder_rel = ctx.get('folder')
+        if not folder_rel:
+            any_rel = next((t.get('relpath') for t in track_list if t.get('relpath')), None)
+            if not any_rel:
+                raise HTTPException(status_code=404, detail="No local relpath available")
+            folder_rel = os.path.dirname(any_rel).replace("\\", "/")
         remote_folder = f"{lm_root}/{folder_rel}"
 
-        # Browse that folder
         c = _bluos_client()
         key = f"LocalMusic:{remote_folder}"
         root = c.browse(key)
-        # Build mapping: normalized title -> action path
+
         def _norm(s: str) -> str:
             return normalize_title(s or "")
 
         items = []
-        mapping = {}
+        browse_items: list[tuple[str, str]] = []
         for el in root.iter():
             if el.tag != 'item':
                 continue
@@ -519,7 +832,28 @@ def bluos_resolve_album(record_id: int, db: Session = Depends(get_db)):
             if not text_title or not play_url:
                 continue
             items.append({'title': text_title, 'playURL': play_url})
-            mapping[_norm(text_title)] = play_url
+            browse_items.append((_norm(text_title), play_url))
+
+        mapping_browse = {k: v for (k, v) in browse_items}
+        mapping: dict[str, str] = dict(mapping_browse)
+        try:
+            import difflib as _difflib
+            local_map = local_album_tracks_from_folder(folder_rel) or local_album_tracks(row["artist"] or "", row["title"] or "") or {}
+            local_titles = [_norm(k) for k in local_map.keys()]
+            thresh = float(os.getenv("BLUOS_FUZZY_THRESHOLD", "0.8"))
+            for lt in local_titles:
+                if lt in mapping:
+                    continue
+                best_play = None
+                best_ratio = 0.0
+                for bt, play in browse_items:
+                    r = _difflib.SequenceMatcher(None, lt, bt).ratio()
+                    if r > best_ratio:
+                        best_ratio, best_play = r, play
+                if best_play and best_ratio >= thresh:
+                    mapping[lt] = best_play
+        except Exception:
+            pass
 
         return {
             'folder': remote_folder,
@@ -527,6 +861,9 @@ def bluos_resolve_album(record_id: int, db: Session = Depends(get_db)):
             'tracks': mapping,
             'artist': row["artist"],
             'album': row["title"],
+            'source': ctx.get('source'),
+            'override': ctx.get('override'),
+            'override_missing': ctx.get('override_missing'),
         }
     except HTTPException:
         raise
@@ -542,12 +879,238 @@ class BluOSActionRequest(BaseModel):
 def bluos_action(req: BluOSActionRequest):
     try:
         c = _bluos_client()
-        root = c.call_action_path(req.path)
+        path = (req.path or "").strip()
+        # If the action implies immediate playback, clear first.
+        pl = path.lower()
+        should_clear = (
+            "/play" in pl or
+            "playnow" in pl or
+            "add-now" in pl or
+            "play=1" in pl or
+            "now=true" in pl or
+            "now=1" in pl
+        )
+        if should_clear:
+            do_on_action = (os.getenv("BLUOS_CLEAR_ON_ACTION", os.getenv("BLUOS_CLEAR_BEFORE_PLAY", "1")) or "1").strip()
+            if do_on_action in ("1", "true", "True", "yes", "on"):
+                _maybe_clear_before_play(c)
+        root = c.call_action_path(path)
         # Try to return a compact status if available
         try:
             return BluOSClient.status_to_dict(root)
         except Exception:
             return {'ok': True}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/bluos/debug/album/{record_id}")
+def bluos_debug_album(
+    record_id: int,
+    title: str | None = None,  # optional: raw title to test
+    do_play: bool = False,
+    clear: bool = False,
+    threshold: float | None = None,
+    db: Session = Depends(get_db)
+):
+    """Debug BluOS resolution and matching for a given album.
+
+    - Lists local titles (normalized) and BluOS browse items (normalized)
+    - Shows best match and ratio for each local title
+    - Optional: attempts to play the specified title via the resolved playURL
+    """
+    try:
+        lm_root = (os.getenv("BLUOS_LIBRARY_ROOT") or "").strip().rstrip("/\\")
+        if not lm_root:
+            return {"error": "BLUOS_LIBRARY_ROOT not configured"}
+
+        # Fetch record basic info
+        row = db.execute(text(
+            "SELECT id, COALESCE(artist_display_name, artist_name) AS artist, title FROM records WHERE id = :id"
+        ), {"id": record_id}).mappings().first()
+        if not row:
+            return {"error": "Record not found"}
+
+        artist = row["artist"] or ""
+        album = row["title"] or ""
+
+        ctx = _resolve_local_album(db, record_id, artist, album)
+        local_list = ctx.get('tracks') if isinstance(ctx, dict) else None
+        if not local_list:
+            return {"error": "No local relpath available; map local files first", "override": ctx.get('override'), "override_missing": ctx.get('override_missing')}
+        local_tracks = []  # [{raw, norm, index, relpath}]
+        for t in local_list:
+            raw = (t.get('title') or '').strip()
+            local_tracks.append({
+                'raw': raw,
+                'norm': normalize_title(raw),
+                'index': t.get('index'),
+                'relpath': t.get('relpath'),
+            })
+
+        folder_rel = ctx.get('folder')
+        if not folder_rel:
+            any_rel = next((t.get('relpath') for t in local_tracks if t.get('relpath')), None)
+            if not any_rel:
+                return {"error": "No local relpath available", "override": ctx.get('override'), "override_missing": ctx.get('override_missing')}
+            folder_rel = os.path.dirname(any_rel).replace('\\', '/')
+        remote_folder = f"{lm_root}/{folder_rel}"
+
+        # Browse BluOS folder
+        c = _bluos_client()
+        pre_status = {}
+        pre_status_extra = {}
+        try:
+            sroot = c.status()
+            pre_status = BluOSClient.status_to_dict(sroot)
+            def _t(tag: str):
+                el = sroot.find(tag)
+                return el.text if el is not None else None
+            pre_status_extra = {
+                "title1": _t("title1"),
+                "title": _t("title"),
+                "song": _t("song"),
+                "state": _t("state"),
+            }
+        except Exception:
+            pre_status = {}
+            pre_status_extra = {}
+        broot = c.browse(f"LocalMusic:{remote_folder}")
+
+        # Collect browse items
+        browse_items = []  # [{raw, norm, playURL}]
+        for el in broot.iter():
+            if el.tag != 'item':
+                continue
+            t = el.attrib.get('type')
+            if t not in ('audio', 'song', 'track', None):
+                continue
+            raw_title = el.attrib.get('text') or ''
+            play = el.attrib.get('playURL') or el.attrib.get('actionURL') or ''
+            if raw_title and play:
+                browse_items.append({
+                    "raw": raw_title,
+                    "norm": normalize_title(raw_title),
+                    "playURL": play
+                })
+
+        # Build match table (local -> best browse)
+        import difflib as _difflib
+        used_threshold = float(threshold if threshold is not None else (os.getenv("BLUOS_FUZZY_THRESHOLD", "0.8") or 0.8))
+        match_table = []
+        b_pairs = [(b["norm"], b["playURL"]) for b in browse_items]
+        for lt in local_tracks:
+            ln = lt["norm"]
+            exact = next((b for b in browse_items if b["norm"] == ln), None)
+            if exact:
+                match_table.append({
+                    "local_raw": lt["raw"],
+                    "local_norm": ln,
+                    "browse_raw": exact["raw"],
+                    "browse_norm": exact["norm"],
+                    "ratio": 1.0,
+                    "exact": True,
+                    "playURL": exact["playURL"],
+                })
+                continue
+            best_play = None
+            best_ratio = 0.0
+            best_raw = None
+            best_norm = None
+            for bn, play in b_pairs:
+                r = _difflib.SequenceMatcher(None, ln, bn).ratio()
+                if r > best_ratio:
+                    best_ratio, best_play, best_norm = r, play, bn
+            if best_play and best_ratio >= used_threshold:
+                # Find raw by norm
+                raw = next((b["raw"] for b in browse_items if b["norm"] == best_norm), None)
+                match_table.append({
+                    "local_raw": lt["raw"],
+                    "local_norm": ln,
+                    "browse_raw": raw,
+                    "browse_norm": best_norm,
+                    "ratio": round(best_ratio, 4),
+                    "exact": False,
+                    "playURL": best_play,
+                })
+            else:
+                match_table.append({
+                    "local_raw": lt["raw"],
+                    "local_norm": ln,
+                    "browse_raw": None,
+                    "browse_norm": None,
+                    "ratio": round(best_ratio, 4),
+                    "exact": False,
+                    "playURL": None,
+                })
+
+        out = {
+            "artist": artist,
+            "album": album,
+            "folder": remote_folder,
+            "threshold": used_threshold,
+            "pre_status": pre_status,
+            "pre_status_extra": pre_status_extra,
+            "local_tracks": local_tracks,
+            "browse_items": browse_items,
+            "matches": match_table,
+            "source": ctx.get('source'),
+            "override": ctx.get('override'),
+            "override_missing": ctx.get('override_missing'),
+        }
+
+        # Optionally attempt to play a specific title
+        if do_play and title:
+            norm_title = normalize_title(title)
+            chosen = next((m for m in match_table if m.get("local_norm") == norm_title and m.get("playURL")), None)
+            if not chosen:
+                out["play"] = {"error": f"No mapping found for '{title}' (norm '{norm_title}')"}
+                return out
+            play_path = chosen.get("playURL")
+            # Clear if requested
+            if clear:
+                try:
+                    _maybe_clear_before_play(c)
+                except Exception:
+                    pass
+            # Execute action and capture raw response
+            try:
+                full_url = f"{c.base}{play_path if play_path.startswith('/') else '/' + play_path}"
+                r = requests.get(full_url, timeout=10)
+                post_status = {}
+                post_status_extra = {}
+                try:
+                    # brief wait for status to update
+                    time.sleep(0.25)
+                    s2 = c.status()
+                    post_status = BluOSClient.status_to_dict(s2)
+                    def _t2(tag: str):
+                        el = s2.find(tag)
+                        return el.text if el is not None else None
+                    post_status_extra = {
+                        "title1": _t2("title1"),
+                        "title": _t2("title"),
+                        "song": _t2("song"),
+                        "state": _t2("state"),
+                    }
+                except Exception:
+                    post_status = {}
+                    post_status_extra = {}
+                out["play"] = {
+                    "requested_title": title,
+                    "normalized": norm_title,
+                    "play_path": play_path,
+                    "http_status": r.status_code,
+                    "response": r.text[:2000],
+                    "post_status": post_status,
+                    "post_status_extra": post_status_extra,
+                }
+            except Exception as pe:
+                out["play"] = {"error": str(pe)}
+
+        return out
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -858,6 +1421,15 @@ def local_ping():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/local/albums/search")
+def local_album_search(q: str = "", limit: int = 50):
+    try:
+        results = local_search_albums(q, limit)
+        return {"items": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/local/scan")
 def local_scan_endpoint():
     try:
@@ -865,6 +1437,64 @@ def local_scan_endpoint():
         return {"ok": True, "albums": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/local/folders")
+def local_folders(path: str = ""):
+    """List immediate subfolders under MUSIC_ROOT/path for folder mapping.
+
+    Returns: { path, parent, items:[{text, folder, hasChildren}], breadcrumb:[{text, path}] }
+    """
+    try:
+        root = get_music_root()
+        if not root:
+            raise HTTPException(status_code=400, detail="MUSIC_ROOT not configured")
+        import os
+        req = (path or "").strip().lstrip("/\\").replace("\\", "/")
+        abs_path = os.path.normpath(os.path.join(root, req))
+        root_norm = os.path.normpath(root)
+        if not abs_path.startswith(root_norm):
+            raise HTTPException(status_code=400, detail="Invalid path")
+        if not os.path.isdir(abs_path):
+            raise HTTPException(status_code=404, detail="Path not found")
+        items = []
+        try:
+            for name in sorted(os.listdir(abs_path)):
+                ap = os.path.join(abs_path, name)
+                if not os.path.isdir(ap):
+                    continue
+                rel = os.path.relpath(ap, start=root_norm).replace("\\", "/")
+                has_children = any(os.path.isdir(os.path.join(ap, _n)) for _n in os.listdir(ap))
+                items.append({"text": name, "folder": rel, "hasChildren": has_children})
+        except Exception:
+            items = []
+        parent = None
+        if req:
+            parent_rel = os.path.dirname(req.rstrip("/"))
+            parent = parent_rel.replace("\\", "/")
+        breadcrumb = [{"text": "Root", "path": ""}]
+        if req:
+            accum = []
+            for part in req.split("/"):
+                if not part:
+                    continue
+                accum.append(part)
+                breadcrumb.append({"text": part, "path": "/".join(accum)})
+        items.sort(key=lambda x: (x.get("text") or "").lower())
+        return {"path": req, "parent": parent, "items": items, "breadcrumb": breadcrumb}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/local/scan")
+def local_scan_get():
+    try:
+        count = local_scan()
+        return {"ok": True, "albums": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/local/album/{record_id}")
@@ -881,23 +1511,122 @@ def local_album_lookup(record_id: int, db: Session = Depends(get_db)):
         if not artist or not title:
             return {"found": False}
 
-        tracks = local_album_tracks(artist, title)
-        if not tracks:
-            return {"found": False}
+        ctx = _resolve_local_album(db, record_id, artist, title)
+        folder = ctx.get('folder')
+        track_map = None
+        if folder:
+            track_map = local_album_tracks_from_folder(folder)
+        if not track_map:
+            artist_lookup = sanitize_for_local(artist) or artist
+            title_lookup = fold_to_ascii(title).strip() or title
+            track_map = local_album_tracks(artist_lookup, title_lookup) or {}
+            if not track_map and (artist_lookup != artist or title_lookup != title):
+                track_map = local_album_tracks(artist, title) or {}
+        if not track_map:
+            return {"found": False, "override": ctx.get('override'), "override_missing": ctx.get('override_missing'), "source": ctx.get('source')}
 
         mapped = {}
-        for norm, info in tracks.items():
-            rel = info.get("path") or ""
+        for norm, info in track_map.items():
+            rel = info.get('path') or info.get('relpath') or ''
             mapped[norm] = {
-                "source": "local",
-                "ratingKey": rel,  # reuse field for simplicity
-                "web_url": local_stream_url(rel),
+                'source': 'local',
+                'ratingKey': rel,
+                'web_url': local_stream_url(rel),
             }
-        return {"found": True, "tracks": mapped}
+        return {
+            'found': True,
+            'tracks': mapped,
+            'folder': folder,
+            'source': ctx.get('source'),
+            'override': ctx.get('override'),
+            'override_missing': ctx.get('override_missing')
+        }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Local album lookup failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/local/album/{record_id}/map")
+def local_album_map_set(record_id: int, body: LocalAlbumMapRequest, db: Session = Depends(get_db)):
+    folder = (body.folder or '').strip() if body else ''
+    if not folder:
+        raise HTTPException(status_code=400, detail="Folder is required")
+    sanitized = folder.strip('/\\').replace('\\', '/')
+    if not sanitized:
+        raise HTTPException(status_code=400, detail="Invalid folder")
+    rec = db.execute(text(
+        "SELECT COALESCE(artist_display_name, artist_name) AS artist, title FROM records WHERE id = :rid"
+    ), {"rid": record_id}).mappings().first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Record not found")
+    tracks = local_album_track_list_from_folder(sanitized)
+    if not tracks:
+        # ensure library is scanned before failing
+        try:
+            local_scan()
+        except Exception:
+            pass
+        tracks = local_album_track_list_from_folder(sanitized)
+    if not tracks:
+        raise HTTPException(status_code=404, detail="Folder not indexed; run local scan")
+    set_local_override(db, record_id, sanitized)
+    ctx = _resolve_local_album(db, record_id, rec.get('artist') or '', rec.get('title') or '')
+    return {
+        'success': True,
+        'folder': ctx.get('folder') or sanitized,
+        'override': ctx.get('override') or sanitized,
+        'override_missing': ctx.get('override_missing'),
+        'track_count': len(ctx.get('tracks') or []),
+        'source': ctx.get('source'),
+    }
+
+
+@app.delete("/local/album/{record_id}/map")
+def local_album_map_clear(record_id: int, db: Session = Depends(get_db)):
+    delete_local_override(db, record_id)
+    return {'success': True}
+
+
+@app.get("/local/album/{record_id}/metadata")
+def local_album_metadata(record_id: int, db: Session = Depends(get_db)):
+    """Return a list of per-track metadata for a record's local album, if available.
+    Each item: { title, artist, album, albumartist, track, disc, duration, genre, path }
+    """
+    try:
+        row = db.execute(text(
+            "SELECT id, title, COALESCE(artist_display_name, artist_name) AS artist FROM records WHERE id = :id"
+        ), {"id": record_id}).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Record not found")
+        artist = (row["artist"] or "").strip()
+        title = (row["title"] or "").strip()
+        if not artist or not title:
+            raise HTTPException(status_code=400, detail="Missing artist/title on record")
+        ctx = _resolve_local_album(db, record_id, artist, title)
+        track_list = ctx.get('tracks') if isinstance(ctx, dict) else None
+        if not track_list:
+            artist_lookup = sanitize_for_local(artist) or artist
+            title_lookup = fold_to_ascii(title).strip() or title
+            track_list = local_album_track_list(artist_lookup, title_lookup)
+            if not track_list and (artist_lookup != artist or title_lookup != title):
+                track_list = local_album_track_list(artist, title)
+        if not track_list:
+            return {"found": False, "tracks": [], "override": ctx.get('override'), "override_missing": ctx.get('override_missing'), "source": ctx.get('source')}
+        out = []
+        for info in track_list:
+            rel = info.get('relpath') or info.get('path')
+            if not rel:
+                continue
+            md = local_read_metadata(rel) or {}
+            md['path'] = rel
+            out.append(md)
+        return {"found": True, "tracks": out, "folder": ctx.get('folder'), "override": ctx.get('override'), "override_missing": ctx.get('override_missing')}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Local album metadata failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -965,6 +1694,25 @@ def local_stream(request: Request):
         raise
     except Exception as e:
         logger.error(f"Local stream failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/local/metadata")
+def local_metadata(p: str):
+    """Read tags and technical metadata for a local file under MUSIC_ROOT.
+    Query param 'p' is the relative path (as shown in /local/album mapping).
+    """
+    try:
+        if not p:
+            raise HTTPException(status_code=400, detail="Missing p")
+        meta = local_read_metadata(p)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Metadata not available")
+        return meta
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"local_metadata failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1278,13 +2026,30 @@ async def sync_partial(background_tasks: BackgroundTasks, db: Session = Depends(
                     rec = client.fetch_release(int(row.discogs_id))
                     if not rec:
                         continue
+                    snapshot, payload_hash = discogs_payload_signature(rec)
                     # Enrich with artwork
                     import asyncio
                     try:
                         loop = asyncio.get_event_loop()
-                        rec = loop.run_until_complete(enrich_with_artwork(rec))
+                        existing_data = db.execute(
+                            text("""
+                                SELECT cover_art_url, cover_thumb_url, artwork_url, mb_release_group_id, original_year, artwork_synced_at
+                                FROM records WHERE id = :id
+                            """),
+                            {"id": row.id}
+                        ).mappings().first()
+                        rec = loop.run_until_complete(
+                            enrich_with_artwork(rec, existing=dict(existing_data) if existing_data else None)
+                        )
                     except RuntimeError:
                         pass
+                    refreshed = rec.pop("_artwork_refreshed", None)
+                    if refreshed:
+                        rec["artwork_synced_at"] = datetime.utcnow()
+                    else:
+                        rec["artwork_synced_at"] = None
+                    rec["discogs_payload"] = json.dumps(snapshot, sort_keys=True)
+                    rec["discogs_payload_hash"] = payload_hash
                     upsert_record(db, rec)
                     db.execute(text("UPDATE records SET last_synced_at = CURRENT_TIMESTAMP WHERE discogs_id = :d"), {"d": rec.get('discogs_id')})
                     db.commit()
@@ -1337,6 +2102,11 @@ def reset_sync_state():
             "progress": 0,
             "message": ""
         })
+        sync_state["recent_items"] = []
+        sync_state["stats"] = {"updated": 0, "unchanged": 0}
+        sync_state["current"] = 0
+        sync_state["total"] = 0
+        sync_state["last_item"] = None
         try:
             sync_logs.clear()
             global sync_log_next_id
@@ -1391,13 +2161,22 @@ def sync_single_record(record_id: int, db: Session = Depends(get_db)):
         rec = client.fetch_release(int(discogs_id))
         if not rec:
             raise HTTPException(status_code=502, detail="Discogs fetch failed")
+        snapshot, payload_hash = discogs_payload_signature(rec)
         # Enrich with artwork
         import asyncio
+        existing_map = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
         try:
             loop = asyncio.get_event_loop()
-            rec = loop.run_until_complete(enrich_with_artwork(rec))
+            rec = loop.run_until_complete(enrich_with_artwork(rec, existing=existing_map))
         except RuntimeError:
             pass
+        refreshed = rec.pop("_artwork_refreshed", None)
+        if refreshed:
+            rec["artwork_synced_at"] = datetime.utcnow()
+        else:
+            rec["artwork_synced_at"] = None
+        rec["discogs_payload"] = json.dumps(snapshot, sort_keys=True)
+        rec["discogs_payload_hash"] = payload_hash
         # If user modified, only fill missing fields
         if getattr(row, 'user_modified_at', None):
             filtered = {}
@@ -1406,10 +2185,21 @@ def sync_single_record(record_id: int, db: Session = Depends(get_db)):
                     existing = getattr(row, k, None)
                     if existing in (None, '', 'null') and v not in (None, '', 'null'):
                         filtered[k] = v
-            if filtered:
-                sets = ", ".join([f"{k} = :{k}" for k in filtered.keys()])
-                filtered['id'] = record_id
-                db.execute(text(f"UPDATE records SET {sets}, last_synced_at = CURRENT_TIMESTAMP WHERE id = :id"), filtered)
+            update_parts = []
+            params = {"id": record_id}
+            for key, value in filtered.items():
+                update_parts.append(f"{key} = :{key}")
+                params[key] = value
+            if rec.get("artwork_synced_at") is not None:
+                update_parts.append("artwork_synced_at = :artwork_synced_at")
+                params["artwork_synced_at"] = rec["artwork_synced_at"]
+            update_parts.append("discogs_payload_hash = :discogs_payload_hash")
+            update_parts.append("discogs_payload = :discogs_payload")
+            params["discogs_payload_hash"] = rec["discogs_payload_hash"]
+            params["discogs_payload"] = rec["discogs_payload"]
+            if update_parts:
+                sets = ", ".join(update_parts)
+                db.execute(text(f"UPDATE records SET {sets}, last_synced_at = CURRENT_TIMESTAMP WHERE id = :id"), params)
                 db.commit()
         else:
             upsert_record(db, rec)
@@ -1477,11 +2267,59 @@ async def search_musicbrainz_artwork(request: ArtworkSearchRequest, db: Session 
                         
                         for image in images:
                             if image.get('front', False) or len(images) == 1:
+                                image_url = (image.get('image') or '').replace('http://', 'https://', 1)
+                                thumbs = image.get('thumbnails') or {}
+                                thumb_map: dict[str, str] = {}
+                                thumb_candidates: list[tuple[int, int, str]] = []
+                                for key, t_url in thumbs.items():
+                                    if not isinstance(t_url, str):
+                                        continue
+                                    t_url_https = t_url.replace('http://', 'https://', 1)
+                                    thumb_map[str(key)] = t_url_https
+                                    width_guess: int | None = None
+                                    height_guess: int | None = None
+                                    if isinstance(key, str) and key.isdigit():
+                                        width_guess = height_guess = int(key)
+                                    else:
+                                        width_guess, height_guess = _extract_dimensions_from_url(t_url_https)
+                                    if width_guess:
+                                        thumb_candidates.append((width_guess, height_guess or width_guess, t_url_https))
+
+                                width = height = None
+                                best_thumb = None
+                                if thumb_candidates:
+                                    thumb_candidates.sort(key=lambda item: item[0], reverse=True)
+                                    width, height, best_thumb = thumb_candidates[0]
+                                else:
+                                    width, height = _extract_dimensions_from_url(image_url)
+
+                                if not best_thumb:
+                                    best_thumb = (thumb_map.get('large') or thumb_map.get('1200') or thumb_map.get('1000') or
+                                                   thumb_map.get('500') or thumb_map.get('small') or image_url)
+
+                                size_bytes = None
+                                if best_thumb:
+                                    try:
+                                        head = requests.head(best_thumb, timeout=8, allow_redirects=True, headers=_build_artwork_headers(best_thumb))
+                                        cl = head.headers.get('Content-Length')
+                                        if cl and cl.isdigit():
+                                            size_bytes = int(cl)
+                                    except requests.RequestException:
+                                        pass
+
+                                size_label = None
+                                if width and height:
+                                    size_label = f"{width}x{height}"
+                                pretty = _format_bytes(size_bytes)
+                                if pretty:
+                                    size_label = f"{size_label or 'Unknown size'} ({pretty})"
+
                                 artwork_info = {
-                                    'url': image.get('image'),
-                                    'thumbnail': image.get('thumbnails', {}).get('large') or image.get('thumbnails', {}).get('small'),
-                                    'width': None,
-                                    'height': None,
+                                    'url': image_url,
+                                    'thumbnail': best_thumb,
+                                    'width': width,
+                                    'height': height,
+                                    'size': size_label or 'Unknown size',
                                     'source': f"MusicBrainz - {release.get('title', 'Unknown')} ({release.get('date', 'Unknown date')})"
                                 }
                                 artworks.append(artwork_info)
@@ -1703,31 +2541,33 @@ async def validate_artwork_url(data: dict):
         if not url:
             return {"valid": False, "error": "Missing url"}
 
-        headers = {"User-Agent": os.getenv("DISCOGS_USER_AGENT", "records-app/1.0")}
+        headers = _build_artwork_headers(url)
         size = None
 
         try:
             head = requests.head(url, timeout=8, allow_redirects=True, headers=headers)
-            ctype = head.headers.get("Content-Type", "")
-            if head.ok and ctype.startswith("image/"):
+            ctype = (head.headers.get("Content-Type") or "")
+            if head.status_code in (200, 206) and ctype.startswith("image/"):
                 cl = head.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     size = int(cl)
                 return {"valid": True, "size": size}
-        except Exception:
+        except requests.RequestException:
             pass
 
         # Fallback: GET a small chunk
         try:
-            r = requests.get(url, timeout=10, stream=True, headers=headers)
-            ctype = r.headers.get("Content-Type", "")
-            if not r.ok or not ctype.startswith("image/"):
-                return {"valid": False}
-            cl = r.headers.get("Content-Length")
-            if cl and cl.isdigit():
-                size = int(cl)
-            return {"valid": True, "size": size}
-        except Exception:
+            get_headers = dict(headers)
+            get_headers.setdefault("Range", "bytes=0-4095")
+            with requests.get(url, timeout=10, stream=True, headers=get_headers) as resp:
+                ctype = (resp.headers.get("Content-Type") or "")
+                if resp.status_code not in (200, 206) or not ctype.startswith("image/"):
+                    return {"valid": False}
+                cl = resp.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    size = int(cl)
+                return {"valid": True, "size": size}
+        except requests.RequestException:
             return {"valid": False}
     except Exception as e:
         return {"valid": False, "error": str(e)}
@@ -1740,10 +2580,18 @@ async def update_artwork_from_url(payload: dict, db: Session = Depends(get_db)):
         artwork_url = (payload.get("artwork_url") or "").strip()
         res = await set_artwork(SetArtworkRequest(record_id=record_id, artwork_url=artwork_url, source="url"), db)
         # Return a simplified shape expected by the frontend
-        return {"success": True, "artwork_url": res.get("artwork_full"), "artwork_thumb": res.get("artwork_thumb")}
+        return {
+            "success": True,
+            "artwork_url": res.get("artwork_full"),
+            "artwork_thumb": res.get("artwork_thumb"),
+            "artwork_source_url": res.get("artwork_source") or artwork_url
+        }
+    except HTTPException as http_err:
+        logger.error(f"Update artwork error: {http_err.detail or http_err}")
+        raise http_err
     except Exception as e:
         logger.error(f"Update artwork error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e) or 'Unexpected error while updating artwork')
 
 # Upload artwork file
 @app.post("/artwork/upload")
@@ -1797,7 +2645,7 @@ async def upload_artwork(record_id: int = Form(...), file: UploadFile = File(...
         })
         db.commit()
 
-        return {"success": True, "artwork_url": artwork_url_path, "artwork_thumb": thumb_url_path}
+        return {"success": True, "artwork_url": artwork_url_path, "artwork_thumb": thumb_url_path, "artwork_source_url": "uploaded"}
     except HTTPException:
         raise
     except Exception as e:
@@ -1833,7 +2681,9 @@ async def remove_artwork_api(payload: dict, db: Session = Depends(get_db)):
             UPDATE records
             SET cover_art_url = NULL,
                 cover_thumb_url = NULL,
-                artwork_url = NULL
+                artwork_url = NULL,
+                artwork_source_url = NULL,
+                user_modified_at = COALESCE(user_modified_at, CURRENT_TIMESTAMP)
             WHERE id = :record_id
         """), {"record_id": record_id})
         db.commit()
@@ -1847,35 +2697,52 @@ async def remove_artwork_api(payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/artwork/set")
+
 async def set_artwork(request: SetArtworkRequest, db: Session = Depends(get_db)):
     """Set artwork for a record"""
     try:
         query = text("SELECT * FROM records WHERE id = :record_id")
         result = db.execute(query, {"record_id": request.record_id}).fetchone()
-        
+
         if not result:
             raise HTTPException(status_code=404, detail="Record not found")
-        
+
         artwork_dir = STATIC_DIR / "artwork"
         thumbs_dir = STATIC_DIR / "thumbs"
         artwork_dir.mkdir(exist_ok=True)
         thumbs_dir.mkdir(exist_ok=True)
-        
+
         discogs_id = result.discogs_id if hasattr(result, 'discogs_id') and result.discogs_id else result.id
         filename = f"{discogs_id}.jpg"
         artwork_path = artwork_dir / filename
         thumb_path = thumbs_dir / f"{discogs_id}_150.jpg"
-        
+
         logger.info(f"Downloading artwork from: {request.artwork_url}")
         logger.info(f"Saving to: {artwork_path}")
-        
-        response = requests.get(request.artwork_url, timeout=30)
+
+        headers = _build_artwork_headers(request.artwork_url)
+        try:
+            response = requests.get(request.artwork_url, timeout=30, headers=headers)
+        except requests.RequestException as req_err:
+            raise HTTPException(status_code=502, detail=f"Error fetching artwork: {req_err}") from req_err
+
+        host = (urlparse(request.artwork_url or '').hostname or '').lower()
+        if response.status_code == 403 and 'discogs' in host:
+            raise HTTPException(
+                status_code=403,
+                detail="Discogs denied the artwork download (HTTP 403). Check DISCOGS_USER_AGENT configuration.",
+            )
         if not response.ok:
-            raise HTTPException(status_code=400, detail="Failed to download artwork")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to download artwork (HTTP {response.status_code})",
+            )
+
+        raw_bytes = response.content
 
         # Convert to JPEG and save; generate thumbnail
         try:
-            img = Image.open(BytesIO(response.content))
+            img = Image.open(BytesIO(raw_bytes))
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             img.save(artwork_path, format="JPEG", quality=92, optimize=True)
@@ -1886,44 +2753,53 @@ async def set_artwork(request: SetArtworkRequest, db: Session = Depends(get_db))
         except Exception as pil_err:
             logger.warning(f"PIL processing failed, saving raw bytes as fallback: {pil_err}")
             with open(artwork_path, 'wb') as f:
-                f.write(response.content)
+                f.write(raw_bytes)
             with open(thumb_path, 'wb') as f:
-                f.write(response.content)
-        
+                f.write(raw_bytes)
+
         logger.info(f"Artwork saved successfully to {artwork_path}")
-        
-        update_query = text("""
+
+        update_query = text(
+            """
             UPDATE records 
             SET artwork_url = :artwork_url,
+                artwork_source_url = :artwork_source_url,
                 cover_art_url = :cover_art_url,
-                cover_thumb_url = :cover_thumb_url
+                cover_thumb_url = :cover_thumb_url,
+                user_modified_at = COALESCE(user_modified_at, CURRENT_TIMESTAMP)
             WHERE id = :record_id
-        """)
-        
+            """
+        )
+
         artwork_url_path = f"/static/artwork/{filename}"
         thumb_url_path = f"/static/thumbs/{filename.replace('.jpg', '_150.jpg')}"
-        
+
         db.execute(update_query, {
-            "artwork_url": request.artwork_url,
+            "artwork_url": artwork_url_path,
+            "artwork_source_url": request.artwork_url,
             "cover_art_url": artwork_url_path,
             "cover_thumb_url": thumb_url_path,
             "record_id": request.record_id
         })
         db.commit()
-        
+
         logger.info(f"Database updated with artwork URLs: {artwork_url_path}, {thumb_url_path}")
-        
+
         return {
             "success": True,
             "artwork_full": artwork_url_path,
-            "artwork_thumb": thumb_url_path
+            "artwork_thumb": thumb_url_path,
+            "artwork_source": request.artwork_url
         }
-        
+
+    except HTTPException as http_err:
+        db.rollback()
+        logger.error(f"Set artwork error: {http_err.detail or http_err}")
+        raise http_err
     except Exception as e:
         db.rollback()
         logger.error(f"Set artwork error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+        raise HTTPException(status_code=500, detail=str(e) or "Unexpected error while setting artwork")
 @app.get("/debug/record/{record_id}")
 async def debug_record(record_id: int, db: Session = Depends(get_db)):
     """Debug endpoint to see record details"""
@@ -1943,6 +2819,7 @@ async def debug_record(record_id: int, db: Session = Depends(get_db)):
             "title": title_field,
             "discogs_id": getattr(result, 'discogs_id', None),
             "artwork_url": getattr(result, 'artwork_url', None),
+            "artwork_source_url": getattr(result, 'artwork_source_url', None),
             "cover_art_url": getattr(result, 'cover_art_url', None),
             "cover_thumb_url": getattr(result, 'cover_thumb_url', None),
             "search_query_musicbrainz": f'artist:"{result.artist_name}" AND release:"{title_field}"',
@@ -1970,7 +2847,7 @@ async def debug_artwork_status(db: Session = Depends(get_db)):
         
         # Now query with only existing columns
         query = text("""
-            SELECT id, artist_name, title, artwork_url, cover_art_url, cover_thumb_url 
+            SELECT id, artist_name, title, artwork_url, artwork_source_url, cover_art_url, cover_thumb_url 
             FROM records 
             WHERE artwork_url IS NOT NULL OR cover_art_url IS NOT NULL
             LIMIT 10
@@ -1986,6 +2863,7 @@ async def debug_artwork_status(db: Session = Depends(get_db)):
                     "artist_name": row.artist_name,
                     "title": row.title,
                     "artwork_url": row.artwork_url,
+                    "artwork_source_url": getattr(row, 'artwork_source_url', None),
                     "cover_art_url": row.cover_art_url,
                     "cover_thumb_url": row.cover_thumb_url
                 }
@@ -2179,28 +3057,27 @@ async def get_record_tracklist(record_id: int, db: Session = Depends(get_db)):
         artist = (rec_row["artist"] or "").strip()
         title = (rec_row["title"] or "").strip()
 
-        # Attempt to build tracklist from local files if album is available
-        if artist and title:
-            local_list = local_album_track_list(artist, title)
-            if local_list:
-                # Build ordered tracklist from local files
-                tl = []
-                for idx, t in enumerate(local_list, start=1):
-                    pos = t.get("index") if isinstance(t.get("index"), int) else idx
-                    dur_s = get_track_duration_seconds(t.get("relpath") or "")
-                    tl.append({
-                        "position": str(pos),
-                        "title": t.get("title") or f"Track {pos}",
-                        "duration": format_duration(dur_s)
-                    })
-                # Store/replace DB tracklist to keep it in sync with files
-                save_record_tracks(db, record_id, tl)
-                return {
-                    "tracklist": tl,
-                    "source": "local_files",
-                    "message": f"Derived {len(tl)} tracks from local library"
-                }
-
+        ctx = _resolve_local_album(db, record_id, artist, title)
+        local_list = ctx.get('tracks') if isinstance(ctx, dict) else None
+        if local_list:
+            tl = []
+            for idx, t in enumerate(local_list, start=1):
+                pos = t.get('index') if isinstance(t.get('index'), int) else idx
+                dur_s = get_track_duration_seconds(t.get('relpath') or '')
+                tl.append({
+                    'position': str(pos),
+                    'title': t.get('title') or f'Track {pos}',
+                    'duration': format_duration(dur_s)
+                })
+            save_record_tracks(db, record_id, tl)
+            return {
+                'tracklist': tl,
+                'source': 'local_files_manual' if ctx.get('source') == 'manual' else 'local_files',
+                'folder': ctx.get('folder'),
+                'override': ctx.get('override'),
+                'override_missing': ctx.get('override_missing'),
+                'message': f"Derived {len(tl)} tracks from local library ({ctx.get('source')})"
+            }
         # Fall back to database-stored tracklist if present
         db_tracks = get_record_tracks(db, record_id)
         if db_tracks:
@@ -2208,6 +3085,9 @@ async def get_record_tracklist(record_id: int, db: Session = Depends(get_db)):
             return {
                 "tracklist": db_tracks,
                 "source": "local",
+                "folder": ctx.get('folder'),
+                "override": ctx.get('override'),
+                "override_missing": ctx.get('override_missing'),
                 "message": f"Loaded {len(db_tracks)} tracks from local database"
             }
 
@@ -2217,6 +3097,9 @@ async def get_record_tracklist(record_id: int, db: Session = Depends(get_db)):
             return {
                 "tracklist": [],
                 "source": "none",
+                "folder": ctx.get('folder'),
+                "override": ctx.get('override'),
+                "override_missing": ctx.get('override_missing'),
                 "message": "No Discogs ID available and no local files found"
             }
         logger.info(f"Fetching tracklist from Discogs for record {record_id}, Discogs ID {discogs_id}")
@@ -2225,11 +3108,17 @@ async def get_record_tracklist(record_id: int, db: Session = Depends(get_db)):
             return {
                 "tracklist": db_tracks,
                 "source": "discogs",
+                "folder": ctx.get('folder'),
+                "override": ctx.get('override'),
+                "override_missing": ctx.get('override_missing'),
                 "message": f"Fetched and stored {len(db_tracks)} tracks from Discogs"
             }
         return {
             "tracklist": [],
             "source": "error",
+            "folder": ctx.get('folder'),
+            "override": ctx.get('override'),
+            "override_missing": ctx.get('override_missing'),
             "message": "Failed to fetch tracklist from Discogs"
         }
     except HTTPException:
@@ -2251,20 +3140,21 @@ def refresh_tracklist_from_local(record_id: int, db: Session = Depends(get_db)):
         title = (row["title"] or "").strip()
         if not artist or not title:
             raise HTTPException(status_code=400, detail="Missing artist/title on record")
-        local_list = local_album_track_list(artist, title)
+        ctx = _resolve_local_album(db, record_id, artist, title)
+        local_list = ctx.get('tracks') if isinstance(ctx, dict) else None
         if not local_list:
-            return {"success": False, "message": "Local album not found"}
+            return {"success": False, "message": "Local album not found", "override": ctx.get('override'), "override_missing": ctx.get('override_missing')}
         tl = []
         for idx, t in enumerate(local_list, start=1):
-            pos = t.get("index") if isinstance(t.get("index"), int) else idx
-            dur_s = get_track_duration_seconds(t.get("relpath") or "")
+            pos = t.get('index') if isinstance(t.get('index'), int) else idx
+            dur_s = get_track_duration_seconds(t.get('relpath') or '')
             tl.append({
-                "position": str(pos),
-                "title": t.get("title") or f"Track {pos}",
-                "duration": format_duration(dur_s)
+                'position': str(pos),
+                'title': t.get('title') or f'Track {pos}',
+                'duration': format_duration(dur_s)
             })
         save_record_tracks(db, record_id, tl)
-        return {"success": True, "source": "local_files", "message": f"Refreshed from local ({len(tl)} tracks)", "tracklist": tl}
+        return {"success": True, "source": "local_files_manual" if ctx.get('source') == 'manual' else "local_files", "message": f"Refreshed from local ({len(tl)} tracks)", "tracklist": tl, "override": ctx.get('override'), "override_missing": ctx.get('override_missing'), "folder": ctx.get('folder')}
     except HTTPException:
         raise
     except Exception as e:
@@ -2319,3 +3209,61 @@ async def delete_record_tracklist(record_id: int, db: Session = Depends(get_db))
         logger.error(f"Error deleting tracklist for record {record_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/bluos/local/browse")
+def bluos_local_browse(key: str = Query("LocalMusic:", alias="key")):
+    """Return BluOS LocalMusic folder structure for mapping dialogs."""
+    try:
+        browse_key = (key or "").strip() or "LocalMusic:"
+        c = _bluos_client()
+        broot = c.browse(browse_key)
+        items = []
+        for el in broot.iter('item'):
+            bkey = el.attrib.get('browseKey')
+            if not bkey:
+                continue
+            if not bkey.startswith('LocalMusic:'):
+                continue
+            item_type = el.attrib.get('type')
+            text_val = el.attrib.get('text') or el.attrib.get('title') or el.attrib.get('name') or ''
+            folder_rel = bkey[len('LocalMusic:'):].lstrip('/')
+            items.append({
+                'text': text_val,
+                'key': bkey,
+                'folder': folder_rel,
+                'type': item_type,
+                'hasChildren': True,
+                'playable': False,
+            })
+        parent = None
+        if browse_key.startswith('LocalMusic:'):
+            suffix = browse_key[len('LocalMusic:'):].lstrip('/')
+            if suffix:
+                parent_parts = suffix.rstrip('/').split('/')
+                parent_parts = parent_parts[:-1]
+                if parent_parts:
+                    parent = 'LocalMusic:/' + '/'.join(parent_parts)
+                else:
+                    parent = 'LocalMusic:'
+        breadcrumb = []
+        if browse_key.startswith('LocalMusic:'):
+            breadcrumb.append({'text': 'Library', 'key': 'LocalMusic:'})
+            suffix = browse_key[len('LocalMusic:'):].lstrip('/')
+            if suffix:
+                accum = []
+                for part in suffix.split('/'):
+                    if not part:
+                        continue
+                    accum.append(part)
+                    breadcrumb.append({'text': part, 'key': 'LocalMusic:/' + '/'.join(accum)})
+        items.sort(key=lambda x: (x.get('text') or '').lower())
+        return {
+            'key': browse_key,
+            'parent': parent,
+            'items': items,
+            'breadcrumb': breadcrumb,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))

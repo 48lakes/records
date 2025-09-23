@@ -1,8 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import logging
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode, quote
+from urllib.parse import quote
 import requests
 import xml.etree.ElementTree as ET
 
@@ -15,6 +15,9 @@ class BluOSClient:
     Config via environment variables:
       - BLUOS_HOST (required, e.g., 192.168.1.100)
       - BLUOS_PORT (optional, default 11000)
+      - BLUOS_CONNECT_TIMEOUT (optional, default 5 seconds)
+      - BLUOS_READ_TIMEOUT (optional, default 10 seconds)
+      - BLUOS_LONG_POLL_GRACE (optional, default 2 seconds)
     """
 
     def __init__(self):
@@ -23,37 +26,80 @@ class BluOSClient:
         if not host:
             raise RuntimeError("BLUOS_HOST is required to use BluOS integration")
         self.base = f"http://{host}:{port}"
+        try:
+            self._connect_timeout = float(os.getenv("BLUOS_CONNECT_TIMEOUT", "5") or 5)
+        except Exception:
+            self._connect_timeout = 5.0
+        try:
+            self._read_timeout = float(os.getenv("BLUOS_READ_TIMEOUT", "10") or 10)
+        except Exception:
+            self._read_timeout = 10.0
+        try:
+            self._long_poll_grace = float(os.getenv("BLUOS_LONG_POLL_GRACE", "2") or 2)
+        except Exception:
+            self._long_poll_grace = 2.0
+
+    def _timeout_tuple(self, read_timeout: Optional[float] = None) -> tuple[float, float]:
+        connect = max(0.5, self._connect_timeout)
+        read = read_timeout if read_timeout is not None else self._read_timeout
+        return (connect, max(1.0, read))
 
     # --- HTTP helpers ---
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    def _get(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        read_timeout: Optional[float] = None,
+    ) -> requests.Response:
         url = f"{self.base}{path}"
-        r = requests.get(url, params=params or {}, timeout=10)
+        r = requests.get(url, params=params or {}, timeout=self._timeout_tuple(read_timeout))
         r.raise_for_status()
         return r
 
-    def _post(self, path: str, data: Optional[Dict[str, Any]] = None) -> requests.Response:
+    def _post(
+        self,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+        read_timeout: Optional[float] = None,
+    ) -> requests.Response:
         url = f"{self.base}{path}"
-        r = requests.post(url, data=data or {}, timeout=10)
+        r = requests.post(url, data=data or {}, timeout=self._timeout_tuple(read_timeout))
         r.raise_for_status()
         return r
 
     # --- Queries ---
     def status(self, timeout: Optional[int] = None, etag: Optional[str] = None) -> ET.Element:
         params: Dict[str, Any] = {}
-        if timeout:
-            params["timeout"] = timeout
+        poll_timeout: Optional[int] = None
+        if timeout is not None:
+            try:
+                poll_timeout = max(1, int(timeout))
+            except Exception:
+                poll_timeout = 1
+            params["timeout"] = poll_timeout
         if etag:
             params["etag"] = etag
-        r = self._get("/Status", params)
+        read_timeout = None
+        if poll_timeout is not None:
+            read_timeout = poll_timeout + self._long_poll_grace
+        r = self._get("/Status", params, read_timeout=read_timeout)
         return ET.fromstring(r.text)
 
     def sync_status(self, timeout: Optional[int] = None, etag: Optional[str] = None) -> ET.Element:
         params: Dict[str, Any] = {}
-        if timeout:
-            params["timeout"] = timeout
+        poll_timeout: Optional[int] = None
+        if timeout is not None:
+            try:
+                poll_timeout = max(1, int(timeout))
+            except Exception:
+                poll_timeout = 1
+            params["timeout"] = poll_timeout
         if etag:
             params["etag"] = etag
-        r = self._get("/SyncStatus", params)
+        read_timeout = None
+        if poll_timeout is not None:
+            read_timeout = poll_timeout + self._long_poll_grace
+        r = self._get("/SyncStatus", params, read_timeout=read_timeout)
         return ET.fromstring(r.text)
 
     # --- Transport ---
@@ -83,6 +129,11 @@ class BluOSClient:
         r = self._get("/Back")
         return ET.fromstring(r.text)
 
+    def clear(self) -> ET.Element:
+        """Clear the current play queue."""
+        r = self._get("/Clear")
+        return ET.fromstring(r.text)
+
     def play_url(self, url: str) -> ET.Element:
         """Ask the player to play a stream URL.
         - Encode the inner stream URL exactly once.
@@ -90,40 +141,50 @@ class BluOSClient:
         """
         enc = quote(url, safe="")
         full = f"{self.base}/Play?url={enc}"
-        r = requests.get(full, timeout=10)
+        r = requests.get(full, timeout=self._timeout_tuple())
         r.raise_for_status()
         return ET.fromstring(r.text)
 
     # --- Browse / actions ---
     def browse(self, key: str) -> ET.Element:
         """Call /Browse with a provided key (e.g., 'LocalMusic:' or 'LocalMusic:/path')."""
-        # Use requests params to encode key once
-        r = requests.get(f"{self.base}/Browse", params={"key": key}, timeout=10)
+        r = requests.get(
+            f"{self.base}/Browse",
+            params={"key": key},
+            timeout=self._timeout_tuple(),
+        )
         r.raise_for_status()
         return ET.fromstring(r.text)
 
     def call_action_path(self, path: str) -> ET.Element:
         """Invoke a returned playURL/actionURL path from a Browse item (e.g., '/Add?...')."""
-        if not path.startswith('/'):
-            path = '/' + path
-        r = requests.get(f"{self.base}{path}", timeout=10)
+        path = (path or "").strip()
+        if not path:
+            raise ValueError("path is required")
+        if path.startswith("http://") or path.startswith("https://"):
+            url = path
+        else:
+            if not path.startswith('/'):
+                path = '/' + path
+            url = f"{self.base}{path}"
+        r = requests.get(url, timeout=self._timeout_tuple())
         r.raise_for_status()
-        # Many action calls return <status> or another root; parse leniently
         try:
             return ET.fromstring(r.text)
         except Exception:
-            # Return a generic element if response is empty/HTML
             root = ET.Element('result')
             root.text = r.text
             return root
 
     # --- Volume ---
-    def volume(self,
-               level: Optional[int] = None,
-               mute: Optional[bool] = None,
-               db: Optional[float] = None,
-               abs_db: Optional[float] = None,
-               tell_slaves: Optional[int] = None) -> ET.Element:
+    def volume(
+        self,
+        level: Optional[int] = None,
+        mute: Optional[bool] = None,
+        db: Optional[float] = None,
+        abs_db: Optional[float] = None,
+        tell_slaves: Optional[int] = None,
+    ) -> ET.Element:
         params: Dict[str, Any] = {}
         if level is not None:
             params["level"] = max(0, min(100, int(level)))
@@ -151,41 +212,43 @@ class BluOSClient:
     @staticmethod
     def status_to_dict(root: ET.Element) -> Dict[str, Any]:
         """Extract a useful subset of /Status into a dict."""
+
         def text(tag: str) -> Optional[str]:
             el = root.find(tag)
             return el.text if el is not None else None
+
         d: Dict[str, Any] = {
             "etag": root.attrib.get("etag"),
             "state": text("state"),
-            "title": text("title1") or text("title") or text("song"),
+            "title": text("title1") or text("title") or text("name") or text("song"),
             "subtitle": text("title2") or text("album"),
-            "artist": text("artist"),
-            "album": text("album"),
+            "artist": text("artist") or text("title2"),
+            "album": text("album") or text("title3"),
             "service": text("service"),
             "image": text("image"),
             "radioImage": text("radioImage"),
             "secs": None,
+            "streamFormat": text("streamFormat"),
+            "quality": text("quality"),
             "totlen": None,
             "volume": None,
             "shuffle": text("shuffle"),
             "repeat": text("repeat"),
         }
-        # secs
         try:
             s = text("secs")
             d["secs"] = int(s) if s is not None else None
         except Exception:
             pass
-        # total length (seconds)
         try:
             tl = text("totlen")
             d["totlen"] = int(tl) if tl is not None else None
         except Exception:
             pass
-        # volume can appear in multiple forms; favor element <volume>
         try:
             v = text("volume")
             d["volume"] = int(v) if v is not None else None
         except Exception:
             pass
         return d
+

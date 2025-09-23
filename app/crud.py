@@ -54,6 +54,7 @@ def list_records_all(db: Session, sort_by="artist", order="asc", format_filter: 
                cover_art_url,
                cover_thumb_url,
                artwork_url,
+               artwork_source_url,
                mb_release_group_id,
                artist_id
         FROM records
@@ -81,15 +82,30 @@ def format_counts(db: Session) -> List[Dict[str, Any]]:
     return [dict(row) for row in db.execute(text(sql)).mappings().all()]
 
 def upsert_record(db: Session, rec: Dict[str, Any]):
+    rec = dict(rec)
+    rec.setdefault("discogs_payload_hash", None)
+    for key in (
+        'discogs_id', 'title', 'artist_name', 'artist_display_name', 'year', 'original_year', 'edition_year',
+        'label', 'country', 'format', 'genre', 'style', 'date_added', 'mb_release_group_id',
+        'cover_art_url', 'cover_thumb_url', 'artist_id'
+    ):
+        rec.setdefault(key, None)
+    rec.setdefault("discogs_payload", None)
+    rec.setdefault("artwork_synced_at", None)
+    rec.setdefault("artwork_source_url", None)
     sql = text(
         """
         INSERT INTO records (
             discogs_id, title, artist_name, artist_display_name, year, original_year, edition_year, label, country, format, genre, style, date_added,
-            mb_release_group_id, cover_art_url, cover_thumb_url, artist_id
+            mb_release_group_id, cover_art_url, cover_thumb_url, artist_id,
+            artwork_source_url,
+            discogs_payload_hash, discogs_payload, artwork_synced_at
         )
         VALUES (
             :discogs_id, :title, :artist_name, :artist_display_name, :year, :original_year, :edition_year, :label, :country, :format, :genre, :style, :date_added,
-            :mb_release_group_id, :cover_art_url, :cover_thumb_url, :artist_id
+            :mb_release_group_id, :cover_art_url, :cover_thumb_url, :artist_id,
+            :artwork_source_url,
+            :discogs_payload_hash, CAST(:discogs_payload AS JSONB), :artwork_synced_at
         )
         ON CONFLICT (discogs_id) DO UPDATE SET
             title = EXCLUDED.title,
@@ -108,7 +124,25 @@ def upsert_record(db: Session, rec: Dict[str, Any]):
             cover_art_url = COALESCE(EXCLUDED.cover_art_url, records.cover_art_url),
             cover_thumb_url = COALESCE(EXCLUDED.cover_thumb_url, records.cover_thumb_url),
             artist_id = COALESCE(EXCLUDED.artist_id, records.artist_id),
-            last_synced_at = CURRENT_TIMESTAMP
+            artwork_source_url = COALESCE(EXCLUDED.artwork_source_url, records.artwork_source_url),
+            discogs_payload_hash = COALESCE(EXCLUDED.discogs_payload_hash, records.discogs_payload_hash),
+            discogs_payload = COALESCE(EXCLUDED.discogs_payload, records.discogs_payload),
+            artwork_synced_at = CASE
+                WHEN EXCLUDED.artwork_synced_at IS NOT NULL THEN EXCLUDED.artwork_synced_at
+                ELSE records.artwork_synced_at
+            END,
+            last_synced_at = CASE
+                WHEN records.discogs_payload_hash IS DISTINCT FROM EXCLUDED.discogs_payload_hash
+                    OR (
+                        EXCLUDED.artwork_synced_at IS NOT NULL
+                        AND (
+                            records.artwork_synced_at IS NULL
+                            OR EXCLUDED.artwork_synced_at > records.artwork_synced_at
+                        )
+                    )
+                THEN CURRENT_TIMESTAMP
+                ELSE records.last_synced_at
+            END
         """
     )
     db.execute(sql, rec)
@@ -119,13 +153,71 @@ def get_record_by_id(db: Session, rec_id: int) -> Optional[Dict[str, Any]]:
         SELECT id, discogs_id, artist_name, title AS album, year, format, label, country, genre, style,
                mb_release_group_id,
                cover_art_url AS artwork_full,
-               COALESCE(cover_thumb_url, cover_art_url) AS artwork_thumb
+               COALESCE(cover_thumb_url, cover_art_url) AS artwork_thumb,
+               artwork_url,
+               artwork_source_url
         FROM records
         WHERE id = :id
         """
     )
     row = db.execute(sql, {"id": rec_id}).mappings().first()
     return dict(row) if row else None
+
+
+def get_record_by_discogs_id(db: Session, discogs_id: int) -> Optional[Dict[str, Any]]:
+    sql = text(
+        """
+        SELECT id,
+               discogs_payload_hash,
+               cover_art_url,
+               cover_thumb_url,
+               artwork_url,
+               artwork_source_url,
+               artwork_synced_at,
+               mb_release_group_id,
+               original_year,
+               last_synced_at
+        FROM records
+        WHERE discogs_id = :discogs_id
+        """
+    )
+    row = db.execute(sql, {"discogs_id": discogs_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def get_local_override(db: Session, record_id: int) -> Optional[str]:
+    row = db.execute(text(
+        "SELECT folder FROM local_album_overrides WHERE record_id = :rid"
+    ), {"rid": record_id}).mappings().first()
+    return row["folder"] if row else None
+
+
+def set_local_override(db: Session, record_id: int, folder: str) -> None:
+    db.execute(text(
+        """
+        INSERT INTO local_album_overrides (record_id, folder, updated_at)
+        VALUES (:rid, :folder, NOW())
+        ON CONFLICT (record_id) DO UPDATE SET
+            folder = EXCLUDED.folder,
+            updated_at = NOW()
+        """
+    ), {"rid": record_id, "folder": folder})
+    db.commit()
+
+
+def delete_local_override(db: Session, record_id: int) -> None:
+    db.execute(text(
+        "DELETE FROM local_album_overrides WHERE record_id = :rid"
+    ), {"rid": record_id})
+    db.commit()
+
+
+def list_manual_overrides(db: Session) -> List[Dict[str, Any]]:
+    rows = db.execute(text(
+        "SELECT record_id, folder, updated_at FROM local_album_overrides"
+    )).mappings().all()
+    return [dict(row) for row in rows]
+
 
 from .models import Track
 from sqlalchemy import text, delete
