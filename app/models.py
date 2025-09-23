@@ -1,6 +1,7 @@
 from __future__ import annotations
 from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
 from sqlalchemy import Integer, String, Text, Column, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 
 Base = declarative_base()
@@ -36,9 +37,13 @@ class Record(Base):
     artist_id = mapped_column(Integer)
     # catalog_number = mapped_column(String)  # This column doesn't exist in your DB
     artwork_url = mapped_column(String)  # This was added successfully
+    artwork_source_url = mapped_column(String, nullable=True)
     # Tracking columns
     user_modified_at = mapped_column(DateTime, nullable=True)
     last_synced_at = mapped_column(DateTime, nullable=True)
+    discogs_payload_hash = mapped_column(String, nullable=True)
+    discogs_payload = mapped_column(JSONB, nullable=True)
+    artwork_synced_at = mapped_column(DateTime, nullable=True)
     
     # Add this relationship
     tracks = relationship("Track", back_populates="record", cascade="all, delete-orphan")
