@@ -1,7 +1,7 @@
 <<<<<<< Updated upstream
 ﻿# Records - Beta
 
-A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI [...]
+A sel-hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI [...]
 
 
 ## Highlights
@@ -267,7 +267,7 @@ Personal project â€” all rights reserved unless otherwise noted.
 =======
 ﻿# Records â€” Beta
 
-A selfâ€‘hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
+A sel-hosted, singleâ€‘page app for browsing a Discogsâ€‘backed music collection with artwork management, local/Plex playback helpers, and optional BluOS control. Backend is FastAPI + PostgreSQL; frontend is a lightweight vanilla JS UI served from the API.
 
 
 ## Highlights
@@ -529,4 +529,5 @@ If you identify any snippet that should carry attribution, please open an issue 
 ## License
 
 Personal project â€” all rights reserved unless otherwise noted.
+
 >>>>>>> Stashed changes
