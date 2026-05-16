@@ -7,4 +7,3 @@ requests==2.33.0
 httpx==0.25.2
 Pillow==12.2.0
 mutagen==1.47.0
-python-dotenv==1.2.2
