@@ -8,3 +8,4 @@ httpx==0.25.2
 Pillow==10.1.0
 mutagen==1.47.0
 python-dotenv==1.0.1
+some-package @ git+https://github.com/psf/requests-toolbelt.git@master
