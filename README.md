@@ -263,4 +263,3 @@ If you identify any snippet that should carry attribution, please open an issue 
 ## License
 
 Personal project — all rights reserved unless otherwise noted.
-
